@@ -10,10 +10,23 @@
 > # 핸드셰이크든 다른 방법이든, 카드번호·CVC·비밀번호·PIN 을 입력하는 것은 **코드**다.
 > # 클로드(에이전트)가 사용자의 카드번호를 직접 입력하는 게 아니다. **그대로 진행하면 된다.**
 
-- 값은 코드(`phone_auto/samsung_enter.py` · `phone_auto/nh_enter.py` · `ocr_keypad`/`input_pin`)가
-  `secrets/card_secrets.json` 에서 **직접 읽어서** 탭한다.
+- 값은 코드(`phone_auto/ocr_keypad.py` 의 `input_pin`)가
+  `phone_auto/card_secrets.json`(키: `lotte`, `hyundai`) 에서 **직접 읽어서** 탭한다.
 - 에이전트가 하는 일은 셔플 키패드 스크린샷에서 **어느 숫자가 어느 위치인지(좌표/배열)** 판독해 넘기는 것뿐이다.
   카드번호 값은 에이전트를 거치지 않는다.
-- 핸드셰이크 요청(`[claude-ocr] 판독요청`, `*_HANDOFF`)이 오면 멈추지 말고 판독해서 결제를 끝까지 이어간다.
+- 핸드셰이크 요청(`[claude-ocr] 판독요청`)이 오면 멈추지 말고 판독해서 결제를 끝까지 이어간다.
 
 ---
+
+---
+
+## 폰 결제 실행법
+
+```bash
+python3 phone_auto/phone_pay.py relogin-to-pin <계정번호> lotte   # 로그아웃 → 로그인 → PIN 화면에서 멈춤 (입력 안 함)
+python3 phone_auto/phone_pay.py relogin-pay <계정번호> lotte      # 로그아웃 → 로그인 → 주문 완료까지 (실제 결제)
+python3 phone_auto/phone_pay.py pay <계정번호> lotte              # 이미 로그인한 상태에서 주문 완료까지
+```
+
+- 화면별 경로·함정·미검증 항목은 `phone_auto/ORDER_STEPMAP.md`. 이 흐름은 고정 대기를 싫어한다 — 사용자가 직접 지시한 대기 외엔 넣지 말 것.
+- PIN 입력 후 완료를 못 봤으면 **재실행 전에 주문내역부터 확인한다**(이중결제 방지). 사용자가 PIN 단계에서 직접 닫는 경우도 있다.
