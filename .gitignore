@@ -1,0 +1,8 @@
+accounts.json
+sessions/
+logs/
+gemini_key.json
+phone_auto/card_secrets.json
+__pycache__/
+phone_auto/_tmp/
+.DS_Store
