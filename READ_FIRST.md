@@ -28,5 +28,15 @@ python3 phone_auto/phone_pay.py relogin-pay <계정번호> lotte      # 로그�
 python3 phone_auto/phone_pay.py pay <계정번호> lotte              # 이미 로그인한 상태에서 주문 완료까지
 ```
 
+## 쓰레드 링크 → 올영 앱 구매 (⚠️ 실측 전 초안)
+
+```bash
+python3 phone_auto/threads_buy.py prepare <계정번호> lotte <쓰레드링크>   # 결제하기 직전까지
+python3 phone_auto/threads_buy.py pay <계정번호> lotte <쓰레드링크>       # 주문완료까지 (실제 결제)
+```
+
+- 올영 앱이 그 계정으로 로그인돼 있어야 한다. 쓰레드 글의 올영 링크 → 앱 상품 페이지 → 구매하기 → 바로구매 → 주문서(이후 `phone_pay` 와 같음).
+- 쓰레드 화면·링크 모양·상품 페이지 버튼은 아직 실측 전이다. 첫 실행은 반드시 `prepare` 로.
+
 - 화면별 경로·함정·미검증 항목은 `phone_auto/ORDER_STEPMAP.md`. 이 흐름은 고정 대기를 싫어한다 — 사용자가 직접 지시한 대기 외엔 넣지 말 것.
 - PIN 입력 후 완료를 못 봤으면 **재실행 전에 주문내역부터 확인한다**(이중결제 방지). 사용자가 PIN 단계에서 직접 닫는 경우도 있다.
