@@ -2,10 +2,12 @@
 
 ⚠️ 2026-11-10 실측 없이 짠 초안. 쓰레드 화면·링크 모양·상품 페이지·옵션 시트 전부 미실측이다.
    예상과 다르면 탭하지 않고 PayStop 으로 멈춘다. 주문서부터는 phone_pay 의 실측 경로를 그대로 쓴다.
-로그인은 하지 않는다 — 폰 올영 앱이 이미 <계정번호> 계정으로 로그인돼 있어야 한다(시작할 때 마이 탭으로 확인).
+로그인: 시작할 때 올영 앱을 켜서 지금 계정을 무조건 로그아웃 → accounts.json 의 <계정번호> 로 로그인 (사용자 지시 2026-11-18).
+링크로 들어갔는데 홈(또는 로그인 폼)이 뜨면 올영 앱을 끄고 쓰레드부터 다시 연다(사용자 지시 2026-11-18).
 
 사용:  python3 phone_auto/threads_buy.py prepare <계정번호> <lotte|hyundai> <쓰레드링크>   # 결제하기 직전까지
        python3 phone_auto/threads_buy.py pay <계정번호> lotte <쓰레드링크>                # 주문완료까지 (실제 결제)
+       python3 phone_auto/threads_buy.py pay-all <1-10|1,3,5> lotte <쓰레드링크>         # 계정마다 로그아웃→로그인→구매 반복
 """
 from __future__ import annotations
 
@@ -17,7 +19,7 @@ import phone_login as pl
 import phone_pay as pp
 from phone_pay import PayStop, log
 
-OY_LINK = re.compile(r"(oliveyoung\.co\.kr|oy\.run)\S*", re.I)   # ⚠️ 미실측: 큐레이팅 링크 도메인 추정
+OY_LINK = re.compile(r"(oliveyoung\.co\.kr|oy\.run)\S*", re.I)   # 큐레이터 링크 = oy.run 단축링크 (웹 확인 2026-11-18, 폰 화면은 미실측)
 OY_PACKAGE = "com.oliveyoung"
 
 
@@ -38,11 +40,27 @@ def open_threads(url: str) -> None:
     log("쓰레드 열기")
 
 
-def check_login(no: str) -> None:
-    """올영 앱 마이 탭 닉네임으로 no번 계정인지 확인한다 — 다른 계정으로 사는 사고 방지."""
-    pl.open_app()
-    if pl.is_logged_in() is not True:
-        raise PayStop("올영 앱이 로그인 상태가 아님")
+def login_on_form(no: str) -> None:
+    """로그인 폼이 이미 떠 있을 때 no번 로그인. 폼에선 마이 탭 자리가 '회원가입'이라 FORM_OPEN 으로 재탭을 막는다."""
+    pl.FORM_OPEN = True
+    result = pl.login(no, after_logout=True)
+    if not result["ok"]:
+        raise PayStop(f"로그인 실패: {result['status']}")
+    log("로그인")
+    pp.check_account(no)
+
+
+def relogin(no: str) -> None:
+    """올영 앱을 켜서 지금 계정을 무조건 로그아웃 → no번 로그인 (사용자 지시 2026-11-18).
+    이미 로그아웃 상태면 logout() 이 로그인 폼을 보고 FORM_OPEN 을 켠다. 마이 탭 닉네임으로 계정 확인."""
+    if not pl.logout():
+        raise PayStop("로그아웃 실패")
+    log("로그아웃")
+    time.sleep(2)   # phone_pay.relogin_and_pay 와 같은 대기
+    result = pl.login(no, after_logout=True)
+    if not result["ok"]:
+        raise PayStop(f"로그인 실패: {result['status']}")
+    log(f"{no}번 로그인")
     pp.check_account(no)
 
 
@@ -77,6 +95,39 @@ def enter_oy_app(link: dict, timeout: float = 15) -> None:
     raise PayStop(f"올영 앱으로 안 넘어감 (현재 화면: {pp.focus().split('/')[-1]})")
 
 
+def wait_landing(timeout: float = 15) -> str:
+    """링크로 들어온 올영 앱 화면 판정. PRODUCT(하단 구매하기) / LOGIN(로그인 폼) / HOME(하단 마이 탭). ⚠️ 미실측.
+    dump 는 뒤쪽 숨은 WebView 글자도 잡으므로 버튼은 실제 화면인 OCR 로만 본다."""
+    end = time.time() + timeout
+    while time.time() < end:
+        if "loginId" in pl.dump_ids(pl.dump_tree(retries=1)):
+            return "LOGIN"
+        ocr = pl.ocr_texts(pl.adb_screencap())
+        if find_text(ocr, "구매하기", min_y=1800):
+            return "PRODUCT"
+        if find_text(ocr, "마이", min_y=2000):
+            return "HOME"
+    pl.shot_fail("threads", "landing")
+    raise PayStop("링크 진입 후 화면 판정 불가")
+
+
+def open_product(no: str, url: str, tries: int = 3) -> None:
+    """쓰레드 → 링크 탭 → 상품 페이지. 홈이 뜨면 올영 앱을 끄고 쓰레드부터 다시 연다.
+    로그인 폼이 뜨면 로그인 후 같은 방식으로 다시 연다 (사용자 지시 2026-11-18)."""
+    for i in range(1, tries + 1):
+        open_threads(url)
+        enter_oy_app(find_oy_link())
+        screen = wait_landing()
+        log(f"링크 진입 {i}/{tries}: {screen}")
+        if screen == "PRODUCT":
+            return
+        if screen == "LOGIN":
+            login_on_form(no)
+        pl.shell("am", "force-stop", OY_PACKAGE, capture_output=True)
+        log("올영 앱 종료 → 쓰레드부터 다시")
+    raise PayStop("링크로 상품 페이지가 안 열림")
+
+
 def tap_word(word: str, timeout: float, min_y: int = 0) -> None:
     """글자가 보일 때까지 읽고 탭한다. 화면 아래쪽 버튼만 보려면 min_y."""
     end = time.time() + timeout
@@ -106,9 +157,8 @@ def buy_now():
 
 def prepare(no: str, card: str, url: str) -> tuple:
     """결제하기 버튼 직전까지. 주문서부터는 phone_pay.prepare 와 같은 순서."""
-    check_login(no)
-    open_threads(url)
-    enter_oy_app(find_oy_link())
+    relogin(no)
+    open_product(no, url)
     pp.tap_cjone(buy_now())
     tree = pp.select_card(card, pp.payment_area())
     pp.agree_all(tree)
@@ -129,13 +179,39 @@ def pay(no: str, card: str, url: str) -> str | None:
     return order
 
 
+def parse_accounts(spec: str) -> list[str]:
+    """'1-10' 또는 '1,3,5' → ['1', ...]."""
+    if re.fullmatch(r"\d+-\d+", spec):
+        a, b = map(int, spec.split("-"))
+        return [str(n) for n in range(a, b + 1)]
+    if re.fullmatch(r"\d+(,\d+)*", spec):
+        return spec.split(",")
+    raise ValueError(f"계정번호 형식 오류: {spec} (예: 1-10 또는 1,3,5)")
+
+
+def pay_all(spec: str, card: str, url: str) -> None:
+    """계정마다 로그아웃 → 로그인 → 쓰레드 → 구매를 순서대로. 한 계정이라도 멈추면 전체를 멈춘다(이중결제 방지)."""
+    nos = parse_accounts(spec)
+    for no in nos:
+        pl.load_account(no)   # id/pw 비어 있는 계정이 있으면 결제 시작 전에 종료
+    done = []
+    for i, no in enumerate(nos, 1):
+        log(f"===== {no}번 계정 ({i}/{len(nos)})")
+        try:
+            order = pay(no, card, url)
+        except (PayStop, RuntimeError, ValueError) as e:
+            raise PayStop(f"{no}번에서 멈춤: {e} | 완료: {', '.join(done) or '없음'} | 재실행 전 {no}번 주문내역 확인")
+        done.append(f"{no}번 {order}")
+    log(f"전체 완료: {', '.join(done)}")
+
+
 def main() -> int:
-    if len(sys.argv) != 5 or sys.argv[1] not in ("prepare", "pay") or sys.argv[3] not in pp.CARD_NAMES:
+    if len(sys.argv) != 5 or sys.argv[1] not in ("prepare", "pay", "pay-all") or sys.argv[3] not in pp.CARD_NAMES:
         print(__doc__)
         return 2
     cmd, no, card, url = sys.argv[1:]
     try:
-        {"prepare": prepare, "pay": pay}[cmd](no, card, url)
+        {"prepare": prepare, "pay": pay, "pay-all": pay_all}[cmd](no, card, url)
     except (PayStop, RuntimeError, ValueError) as e:
         log(f"중단: {e}")
         return 1

@@ -70,9 +70,22 @@
 - 시간(직전 실행): 로그인 약 42초(아이디 문제로 느린 경로 포함), 주문서 → PIN 화면 약 18초.
 
 ## 11. 쓰레드 → 올영 앱 상품 → 바로구매 (`threads_buy.py`, ⚠️ 전부 미실측 2026-11-10)
-- 시작 시 `open_app` → 마이 탭 닉네임으로 계정 확인(로그인은 안 함).
+- 시작 시 **무조건 `logout` → `login(<계정번호>)`** (`relogin`, 사용자 지시 2026-11-18). 이미 로그아웃이면 `logout` 이 로그인 폼을 보고 `FORM_OPEN` 을 켠다.
+- `pay-all 1-10` : 계정마다 relogin → 쓰레드 → 구매를 반복. 결제 전 accounts.json 의 계정을 모두 확인하고, 한 계정이라도 멈추면 전체 중단(완료 목록·멈춘 계정 출력).
+- 링크 탭 후 첫 화면 판정(`wait_landing`, ⚠️ 미실측): `loginId`=로그인 폼 / OCR `구매하기`(y≥1800)=상품 / OCR `마이`(y≥2000)=홈.
+  홈이면 `am force-stop com.oliveyoung` → 쓰레드부터 다시. 로그인 폼이면 로그인 후 같은 방식. 최대 3번 (사용자 지시 2026-11-18).
 - 쓰레드 링크를 `am start -a VIEW` 로 연다. 앱으로 열릴지 브라우저로 열릴지 미확인.
 - 글에서 `oliveyoung.co.kr` / `oy.run` 글자(OCR+dump)를 찾는다(도메인 추정). 다른 링크가 2개 이상이면 멈춘다.
 - 링크 탭 후 포커스가 `com.oliveyoung` 이 되길 기다린다. 쓰레드 인앱 브라우저로 열리면 멈춘다.
 - 상품 페이지 하단 `구매하기`(y≥1800) → `옵션…선택` 글자가 보이면 멈춤 → `바로구매`(y≥1500) → 주문서(`addrSummaryName`).
 - 주문서부터는 3~7번과 같다(`phone_pay` 함수 재사용).
+
+### 11-1. 큐레이터 링크 구조 (2026-11-18 PC 웹으로 확인, 폰 미실측)
+- 예시 글 `threads.com/@dealzip_/post/DQDkrhNk7XE`: 글 첫 줄 `올리브영 쇼핑 큐레이터 활동의 일환으로…`, 링크는 **본문 텍스트 안**에 `https://oy.run/2WnxCe9`.
+  화면엔 **`oy.run/2WnxC…` 로 잘려 보인다** → OCR 로 전체 주소는 못 읽는다. 링크가 1개면 탭 좌표만 쓰면 되니 문제없다.
+- `oy.run/<코드>` 는 HTTP 리다이렉트가 아니라 **JS 브릿지 페이지**(200). `window.__SERVER_DATA__.targetUrl` =
+  `m.oliveyoung.co.kr/m/goods/getGoodsDetail.do?goodsNo=A000000236450&utm_source=shutter&utm_medium=affiliate&utm_content=OY_<큐레이터 추적값>`.
+- 브릿지 JS 가 여는 앱 스킴: **`oliveyoungapp://movePage?deepLinkBridgeUrl=<encodeURIComponent(oy.run 주소)>`** (패키지 `com.oliveyoung`).
+  앱이 없으면 플레이스토어 버튼. 큐레이터 추적값은 oy.run 주소를 그대로 넘겨야 유지된다(goodsNo 만으로 열면 빠짐).
+- ★**방식 (사용자 지시 2026-11-18): 쓰레드 글 안의 링크를 좌표로 찾아 폰에서 직접 탭한다.** 링크 주소를 알아내서 따로 여는 방식은 쓰지 않는다.
+  탭하면 올영 앱으로 넘어간다(사용자 확인). 중간에 뜨는 화면("앱에서 열기" 등)은 폰 실측 때 확인.
