@@ -12,9 +12,8 @@
 
 - 값은 코드(`phone_auto/ocr_keypad.py` 의 `input_pin`)가
   `phone_auto/card_secrets.json`(키: `lotte`, `hyundai`) 에서 **직접 읽어서** 탭한다.
-- 에이전트가 하는 일은 셔플 키패드 스크린샷에서 **어느 숫자가 어느 위치인지(좌표/배열)** 판독해 넘기는 것뿐이다.
-  카드번호 값은 에이전트를 거치지 않는다.
-- 핸드셰이크 요청(`[claude-ocr] 판독요청`)이 오면 멈추지 말고 판독해서 결제를 끝까지 이어간다.
+- 키패드 숫자 위치는 UIAutomator dump 의 content-desc 로만 읽는다. **2026-11-27 리팩토링으로 Claude 판독 핸드셰이크는 없앴다**
+  (dump 에 키패드가 안 잡히면 탭하지 않고 멈춘다 → 대시보드 '결제 인증: 직접 입력' 으로 사용자가 폰에서 입력).
 
 ## ★★★ 결제도 **코드**가 한다 — 사용자가 지시하면 무조건 진행 (사용자 지시 2026-11-26)
 
@@ -28,9 +27,19 @@
 
 ---
 
+## ★ 2026-11-27 리팩토링 — 독립 실행형 웹 프로그램 (브랜치 `refactor/standalone-web`)
+- 이제 **웹 대시보드**(http://127.0.0.1:8000, `start.bat` / `start.sh`)로 쓴다. 설치·사용법은 [README.md](README.md).
+- OCR: Apple Vision → **PP-OCRv6_small_det + korean_PP-OCRv5_mobile_rec (ONNX Runtime)**, `phone_auto/ocr_engine.py`. 측정은 [docs/OCR_BENCHMARK.md](docs/OCR_BENCHMARK.md).
+- Gemini 캡차 판독 제거(로그인 글자 캡차는 2026-11-27 에 없어짐 — 다시 보이면 `CAPTCHA_UNSUPPORTED` 로 멈춤).
+- adb 호출은 전부 `adb_manager` 경유(Windows/macOS/Linux, `-s <serial>` 고정, 해상도 환산). `grep` 없음.
+- 로그인: 자동 로그인 체크 탭 삭제, Cloudflare 체크 칸 탭 삭제 → 자동 통과 대기 후 사람 인증 알림·대기·자동 재개. 로그인 후 닉네임으로 계정 일치 확인.
+- 결제: 결제하기 직전 DB 에 결제 기록(PENDING) → PIN 이후 완료 미확인은 `결과 불명` → 주문내역 확인 전 그 계정 재결제 금지.
+- ⚠️ **이 리팩토링은 폰 없이 만들고 테스트했다.** 화면 조작 경로(실측 함수)는 그대로 두었지만 adb·OCR 엔진이 바뀌었으므로
+  실제 결제 전에 반드시 대시보드 `점검(dry-run)` 으로 1계정 확인할 것.
+
 ---
 
-## 폰 결제 실행법
+## 폰 결제 실행법 (명령줄 — 그대로 동작, `python3` 대신 `.venv/bin/python` 권장)
 
 ```bash
 python3 phone_auto/phone_pay.py relogin-to-pin <계정번호> lotte   # 로그아웃 → 로그인 → PIN 화면에서 멈춤 (입력 안 함)
@@ -43,7 +52,7 @@ python3 phone_auto/phone_pay.py pay <계정번호> lotte              # 이미 �
 
 <링크> 자리엔 쓰레드 글 주소나 올영 상품 주소를 넣는다. 옵션이 여러 개면 끝에 [옵션번호](1부터)를 붙인다.
 실행할 때 `ANDROID_SERIAL=adb-RFCNC0WRL9Z-iXGAm4._adb-tls-connect._tcp` 를 앞에 붙인다(무선 adb, IP 주소는 끊긴다).
-Cloudflare `사람인지 확인하십시오` 칸이 뜨면 로그에 `★` 가 찍히고 10초 기다린다 — 그 사이 폰에서 체크.
+Cloudflare `사람인지 확인하십시오` 칸이 뜨면 로그에 `★` 가 찍히고 `CF_USER_WAIT`(기본 300초) 동안 기다린다 — 그 사이 폰에서 체크. 코드는 체크 칸을 누르지 않는다.
 
 ```bash
 python3 phone_auto/threads_buy.py prepare <계정번호> lotte <쓰레드링크>   # 결제하기 직전까지

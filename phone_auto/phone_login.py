@@ -1,123 +1,93 @@
-"""올리브영 폰 앱 로그인 — ADB + uiautomator dump/OCR 병합 + Gemini Vision 캡차 인식.
+"""올리브영 폰 앱 로그인 — ADB + uiautomator dump/OCR 병합.
 
 흐름 (이 모듈 = 폰 결제 순서 0번):
   detect_screen() 으로 현재 화면 판정 → 로그인 화면이면
-  ID/PW 입력 → 캡차 bounds 크롭 → Gemini 6자리 → 캡차 입력 → 로그인 → detect_screen 으로 성공 판정.
+  ID/PW 입력 → 값 검증 → Cloudflare 인증 상태 확인 → 로그인 → 마이 탭 닉네임으로 성공·계정 일치 판정.
+
+2026-11-27 이후 로그인 폼의 글자 캡차(autoBlockText)는 없어지고 Cloudflare 위젯으로 바뀌었다.
+글자 캡차가 다시 보이면 자동 판독하지 않고 CAPTCHA_UNSUPPORTED 로 멈춘다(외부 OCR/LLM API 를 쓰지 않는다).
+체크박스(자동 로그인·아이디 저장)는 어떤 경우에도 누르지 않는다 — 지금 상태를 그대로 둔다.
+Cloudflare 위젯은 자동 통과('성공!')만 기다리고, 사람 확인 칸이 뜨면 AUTH_HOOK 으로 알린 뒤 사용자가 폰에서
+직접 체크할 때까지 기다렸다가 자동으로 이어간다(체크 칸을 대신 누르지 않는다).
 
 재시도 규칙:
-  · 시도는 최대 3회(MAX_ATTEMPTS). 캡차 판독 실패(6자리 아님)는 새로고침 후 다음 시도.
-  · 로그인 제출 실패가 2회 연속(MAX_CONSEC_FAIL)이면 그 계정은 중단 → 사용자 보고.
+  · 시도는 최대 3회(MAX_ATTEMPTS). 로그인 제출 실패가 2회 연속(MAX_CONSEC_FAIL)이면 그 계정은 중단.
 
-화면 요소 찾기 (좌표 하드코딩 금지):
+화면 요소 찾기 (좌표 하드코딩 최소화):
   dump 노드(resource-id / text / content-desc / hint / class) → 없으면 OCR 텍스트
   → 그래도 없으면 layout 파일의 실측 좌표 xy. 선택자·좌표는 oy_login_layout.json 으로 덮어쓴다.
-  로그인 화면 요소는 2026-11-04 실측값(DEFAULT_LAYOUT 주석). ⚠️ 로그인 성공 화면·오류 문구는 아직 미실측
-  (SCREEN_MARKERS 주석) — `python3 phone_auto/phone_login.py dump` 로 떠서 보강할 것.
+  고정 좌표는 1080x2400 실측값이며 adb_manager.pt() 로 기기 해상도에 맞춰 환산한다.
 
 아이디·비번은 accounts.json 에서 직접 읽고 화면·로그에 출력하지 않는다.
-Gemini 키는 환경변수 GEMINI_API_KEY 또는 프로젝트 루트 gemini_key.json (gitignore, 코드·저장소에 넣지 않는다).
-기기가 여러 대면 ANDROID_SERIAL 환경변수로 고정(adb 가 자동으로 따른다).
+기기는 adb_manager 가 고른 serial(또는 ANDROID_SERIAL)을 쓴다.
 
 사용:
-  python3 phone_auto/phone_login.py login 1     # 1번 계정 로그인
-  python3 phone_auto/phone_login.py logout      # 마이페이지 맨 아래 로그아웃
-  python3 phone_auto/phone_login.py detect      # 현재 화면 판정만
-  python3 phone_auto/phone_login.py dump        # 실측용 dump xml + 스크린샷 저장
+  python phone_auto/phone_login.py login 1     # 1번 계정 로그인
+  python phone_auto/phone_login.py logout      # 마이페이지 맨 아래 로그아웃
+  python phone_auto/phone_login.py detect      # 현재 화면 판정만
+  python phone_auto/phone_login.py dump        # 실측용 dump xml + 스크린샷 저장
 """
 from __future__ import annotations
 
 import datetime as dt
 import json
 import os
+import re
 import shlex
 import sys
+import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
-def _load_gemini_key() -> str:
-    """환경변수 GEMINI_API_KEY → 없으면 프로젝트 루트 gemini_key.json(gitignore)."""
-    key_file = Path(__file__).resolve().parent.parent / "gemini_key.json"
-    if os.environ.get("GEMINI_API_KEY"):
-        return os.environ["GEMINI_API_KEY"]
-    if key_file.exists():
-        return json.loads(key_file.read_text(encoding="utf-8")).get("GEMINI_API_KEY") or "YOUR_API_KEY"
-    return "YOUR_API_KEY"
-
-
-# ===== 캡차 Vision LLM 인식 핵심 코드 (사용자 테스트 완료본 — 키 출처만 환경변수/gemini_key.json 으로) =====
-import subprocess
-import time
-import io
-import re
-import xml.etree.ElementTree as ET
 from PIL import Image
-from google import genai
-from google.genai import types
 
-# 설정
-GEMINI_API_KEY = _load_gemini_key()
-client = genai.Client(api_key=GEMINI_API_KEY)
+import adb_manager as adb
+import screen_reader as sr
+
+AUTH_HOOK = None          # callable(kind: str, message: str) — 사람 인증이 필요할 때·끝났을 때 알림 (작업 엔진이 설정)
+CF_AUTO_WAIT = 15         # Cloudflare 자동 통과 대기(초)
+CF_USER_WAIT = float(os.environ.get("CF_USER_WAIT", "300"))   # 사람 인증 대기(초)
+
+
+def _notify(kind: str, message: str) -> None:
+    print(f"[phone_login] {message}", flush=True)
+    if AUTH_HOOK:
+        try:
+            AUTH_HOOK(kind, message)
+        except Exception:
+            pass
+
+
+class AdbCallError(RuntimeError):
+    """예전 subprocess.CalledProcessError 자리. 메시지에 명령 인자(비번)를 넣지 않는다."""
+
 
 def shell(*args, capture_output=False):
-    cmd = ["adb", "shell", *args]
-    if capture_output:
-        return subprocess.run(cmd, check=True, capture_output=True, text=True).stdout
-    subprocess.run(cmd, check=True)
+    try:
+        out = adb.shell(*args)
+    except adb.AdbError as e:
+        raise AdbCallError(str(e)) from None
+    finally:
+        if args and not str(args[0]).startswith(("dumpsys", "wm", "getprop")):
+            sr.invalidate()   # 입력·앱 전환 뒤엔 스크린샷을 새로 찍는다
+    return out if capture_output else None
+
 
 def adb_screencap() -> Image.Image:
-    proc = subprocess.run(["adb", "exec-out", "screencap", "-p"], capture_output=True, check=True)
-    return Image.open(io.BytesIO(proc.stdout))
+    return sr.screenshot()
+
 
 def get_ui_hierarchy() -> ET.Element:
-    subprocess.run(["adb", "shell", "uiautomator", "dump", "/sdcard/window_dump.xml"], check=True)
-    xml_str = subprocess.run(["adb", "shell", "cat", "/sdcard/window_dump.xml"], capture_output=True, text=True, check=True).stdout
-    return ET.fromstring(xml_str)
-
-def recognize_captcha_with_llm(captcha_crop: Image.Image) -> str | None:
-    buf = io.BytesIO()
-    captcha_crop.save(buf, format="PNG")
-    prompt = (
-        "사진 속 왜곡된 6자리 숫자만 공백 없이 순수 숫자로 출력해줘. "
-        "다른 말은 절대 하지 마. 숫자가 없으면 'NONE'이라고만 출력해."
-    )
     try:
-        response = client.models.generate_content(
-            # 2026-11-04 실측: 2.5-flash = 신규 키 404 / 3.8·3.5-flash = 무료 티어 503 과부하 / 3.5-flash-lite = 정답
-            model='gemini-3.5-flash-lite',
-            contents=[
-                types.Part.from_bytes(data=buf.getvalue(), mime_type='image/png'),
-                prompt
-            ]
-        )
-        text = (response.text or "").strip()
-        digits = "".join(ch for ch in text if ch.isdigit())
-        if len(digits) == 6:
-            return digits
-        print(f"[LLM 인식 실패] 응답: {text}")
-        return None
-    except Exception as e:
-        print(f"[LLM API 에러] {e}")
-        return None
-
-def extract_captcha_image(full_img: Image.Image, ui_tree: ET.Element) -> Image.Image | None:
-    # 실측 후 resource-id나 bounds 조건을 수정해야 함. 임시로 ImageView 크기 기반 탐색.
-    for node in ui_tree.iter('node'):
-        cls = node.attrib.get('class', '')
-        if 'ImageView' in cls:
-            bounds_str = node.attrib.get('bounds', '')
-            m = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', bounds_str)
-            if m:
-                x1, y1, x2, y2 = map(int, m.groups())
-                if 200 < (x2 - x1) < 800 and 80 < (y2 - y1) < 300:
-                    return full_img.crop((x1, y1, x2, y2))
-    return None
-# ===== 여기까지 =====
+        return ET.fromstring(adb.dump_xml())
+    except adb.AdbError as e:
+        raise AdbCallError(str(e)) from None
 
 
 ROOT = Path(__file__).resolve().parent.parent
 ACCOUNTS = ROOT / "accounts.json"
 LAYOUT_FILE = Path(__file__).resolve().parent / "oy_login_layout.json"
 LOG_DIR = ROOT / "logs"
-CAPTCHA_DIR = LOG_DIR / "captcha"
 MAX_ATTEMPTS = 3
 MY_TAB = (990, 2208)   # 하단 '마이' 탭 (2026-11-05 실측)
 FORM_OPEN = False      # logout() 이 이미 로그인 폼을 보고 있으면 True
@@ -134,8 +104,7 @@ RESULT_TIMEOUT = 12   # 로그인 버튼 후 결과 화면 대기(초)
 DEFAULT_LAYOUT = {
     "id_field":        {"rid": "loginId"},                                    # [39,494][1040,640]
     "pw_field":        {"rid": "password"},                                   # [39,631][1040,775]
-    # 비밀번호 아래 체크박스 (자동 로그인). text 로 찾고, rid 가 있으면 oy_login_layout.json 으로 덮어쓴다.
-    "auto_login_check": {"text": "자동 로그인"},
+    # 자동 로그인 및 아이디 저장 체크박스는 조작하지 않는다.
     "captcha_field":   {"rid": "autoBlockText"},                              # [39,1222][1040,1346] — 2026-11-27 이후 없음
     "captcha_image":   {"desc": "자동 입력방지 문자 입력 이미지", "cls": "Image"},  # [42,1003][759,1197]
     "captcha_refresh": {"rid": "reLoad"},                                     # [756,1000][1040,1101]
@@ -167,10 +136,19 @@ def load_layout() -> dict:
     return layout
 
 
+def load_accounts() -> dict:
+    if not ACCOUNTS.exists():
+        raise ValueError("accounts.json 이 없음 (accounts.example.json 참고)")
+    try:
+        return json.loads(ACCOUNTS.read_text(encoding="utf-8"))
+    except ValueError:
+        raise ValueError("accounts.json 형식 오류") from None
+
+
 def load_account(no: str) -> dict:
-    acct = json.loads(ACCOUNTS.read_text(encoding="utf-8")).get(no)
+    acct = load_accounts().get(str(no))
     if not acct or not acct.get("id") or not acct.get("pw"):
-        sys.exit(f"[phone_login] accounts.json 에 {no}번 id/pw 가 비어 있음")
+        raise ValueError(f"accounts.json 에 {no}번 id/pw 가 비어 있음")
     return acct
 
 
@@ -186,7 +164,7 @@ def dump_tree(retries: int = 3) -> ET.Element | None:
     for _ in range(retries):
         try:
             return fill_empty_webview(get_ui_hierarchy())
-        except (subprocess.CalledProcessError, ET.ParseError) as e:
+        except (AdbCallError, ET.ParseError) as e:
             print(f"   [dump] 실패, 재시도: {e}", flush=True)
             time.sleep(0.7)
     return None
@@ -231,29 +209,14 @@ def dump_texts(tree: ET.Element | None) -> list[dict]:
     return out
 
 
-def ocr_texts(img: Image.Image) -> list[dict]:
-    """macOS Apple Vision OCR. 맥이 아니면 빈 목록(→ dump/실측 좌표만으로 진행)."""
+def ocr_texts(img: Image.Image | None = None, region=None) -> list[dict]:
+    """PP-OCRv6 + korean PP-OCRv5 (ocr_engine). {text,cx,cy,src} + confidence/box/bbox. 좌표는 원본 해상도.
+    img 를 안 주면 지금 화면. 보안 인증 화면(카드앱)에서는 빈 목록 — 일반 OCR 로 조작하지 않는다."""
     try:
-        import Vision, Quartz
-    except ImportError:
+        return sr.ocr(img, region=region)
+    except sr.SecureScreen:
+        print("[phone_login] 보안 인증 화면 — OCR 생략", flush=True)
         return []
-    buf = io.BytesIO(); img.save(buf, format="PNG")
-    data = Quartz.CFDataCreate(None, buf.getvalue(), len(buf.getvalue()))
-    cg = Quartz.CGImageSourceCreateImageAtIndex(Quartz.CGImageSourceCreateWithData(data, None), 0, None)
-    W, H = Quartz.CGImageGetWidth(cg), Quartz.CGImageGetHeight(cg)
-    req = Vision.VNRecognizeTextRequest.alloc().init()
-    req.setRecognitionLevel_(Vision.VNRequestTextRecognitionLevelAccurate)
-    req.setRecognitionLanguages_(['ko-KR', 'en-US'])
-    Vision.VNImageRequestHandler.alloc().initWithCGImage_options_(cg, {}).performRequests_error_([req], None)
-    items = []
-    for obs in (req.results() or []):
-        text = (obs.topCandidates_(1)[0].string() or "").strip()
-        bb = obs.boundingBox()
-        if text:
-            items.append({"text": text, "src": "ocr",
-                          "cx": int((bb.origin.x + bb.size.width / 2) * W),
-                          "cy": int((1 - bb.origin.y - bb.size.height / 2) * H)})
-    return items
 
 
 def read_screen() -> tuple[Image.Image, ET.Element | None, list[dict]]:
@@ -316,20 +279,10 @@ def locate(name: str, layout: dict, tree: ET.Element | None, texts: list[dict]) 
     return tuple(sel["xy"]) if sel.get("xy") else None
 
 
-def crop_captcha(img: Image.Image, tree: ET.Element | None, layout: dict) -> Image.Image | None:
-    """캡차 이미지 크롭: 선택자 bounds → 실측 box → 사용자 휴리스틱(extract_captcha_image) 순."""
-    b = find_node_bounds(tree, layout["captcha_image"])
-    if b:
-        return img.crop(b)
-    if layout["captcha_image"].get("box"):
-        return img.crop(tuple(layout["captcha_image"]["box"]))
-    return extract_captcha_image(img, tree) if tree is not None else None
-
-
 # ---------- 입력 ----------
 
 def tap(xy: tuple[int, int]) -> None:
-    shell("input", "tap", str(xy[0]), str(xy[1]))
+    shell("input", "tap", str(int(xy[0])), str(int(xy[1])))
 
 
 def type_into(xy: tuple[int, int], value: str, clear: int = 30) -> None:
@@ -342,37 +295,17 @@ def type_into(xy: tuple[int, int], value: str, clear: int = 30) -> None:
     time.sleep(0.3)
 
 
-def save_captcha(crop: Image.Image, answer: str | None) -> None:
-    """판독 감사용 — 크롭과 LLM 답을 파일명에 남긴다(오답 패턴 실측용)."""
-    CAPTCHA_DIR.mkdir(parents=True, exist_ok=True)
-    crop.save(CAPTCHA_DIR / f"{dt.datetime.now():%m%d_%H%M%S}_{answer or 'NONE'}.png")
-
-
 # ---------- 로그인 ----------
 
 def solve_captcha(layout: dict) -> tuple[str | None, ET.Element | None]:
-    """캡차 답과, 입력칸 위치에 다시 쓸 dump 트리."""
-    tree = dump_tree()      # dump 가 끝난 뒤 찍어야 캡차 이미지가 로드돼 있다 (먼저 찍으면 빈 칸 → NONE, 실측)
+    """캡차 칸이 없으면 ("", tree). 글자 캡차가 다시 생겼으면 (None, tree) — 자동 판독하지 않는다
+    (외부 OCR·LLM API 미사용 방침). 로그인은 CAPTCHA_UNSUPPORTED 로 멈춘다."""
+    tree = dump_tree()
     if find_node_bounds(tree, layout["captcha_field"]) is None and "loginId" in dump_ids(tree):
-        print("[phone_login] 캡차 칸 없음 → 아이디·비번만 입력 (사용자 지시 2026-11-27)", flush=True)
-        return "", tree     # "" = 캡차 없음. None = 캡차는 있는데 못 읽음
-    img = adb_screencap()
-    crop = crop_captcha(img, tree, layout)
-    if crop is None:
-        print("[phone_login] 캡차 이미지 영역을 못 찾음 — layout captcha_image 실측 필요", flush=True)
-        return None, tree
-    answer = recognize_captcha_with_llm(crop)
-    save_captcha(crop, answer)
-    return answer, tree
-
-
-def refresh_captcha(layout: dict) -> None:
-    _, tree, texts = read_screen()
-    xy = locate("captcha_refresh", layout, tree, texts)
-    if xy:
-        tap(xy); time.sleep(0.5)
-    else:
-        print("[phone_login] 캡차 새로고침 버튼 못 찾음 — layout captcha_refresh 실측 필요", flush=True)
+        return "", tree
+    if "loginId" in dump_ids(tree):
+        print("[phone_login] 글자 캡차 칸이 보임 — 자동 판독 안 함", flush=True)
+    return None, tree
 
 
 def fill_fast(acct: dict, code: str, layout: dict, tree: ET.Element | None) -> ET.Element | None:
@@ -402,7 +335,7 @@ def fill_fast(acct: dict, code: str, layout: dict, tree: ET.Element | None) -> E
         t2 = time.time()
         if code:
             shell(typed("captcha_field", code))
-    except subprocess.CalledProcessError:
+    except AdbCallError:
         raise RuntimeError("로그인 입력 중 adb 실패") from None
     t3 = time.time()
     result = inputs_ok(acct, code, layout)
@@ -439,55 +372,8 @@ def inputs_ok(acct: dict, code: str, layout: dict) -> ET.Element | None:
     return tree
 
 
-def ensure_auto_login_checked(layout: dict, tree: ET.Element | None = None) -> None:
-    """비밀번호 아래 '자동 로그인' 체크박스를 켠다.
-    dump 의 checked 속성은 주문서 동의 칸처럼 안 바뀔 수 있으므로(실측 패턴),
-    이미 checked=true 이면 스킵하고, 아니면 라벨/체크박스 자리를 탭한다.
-    글자(OCR)로도 찾고, 비밀번호 필드 바로 아래 CheckBox 도 후보로 본다."""
-    if tree is None:
-        tree = dump_tree(retries=1)
-    texts = dump_texts(tree) if tree is not None else []
-    xy = locate("auto_login_check", layout, tree, texts)
-    node = None
-    if tree is not None:
-        node = next((n for n in tree.iter("node") if _node_matches(n, layout["auto_login_check"])), None)
-        if node is None:
-            pw = next((n for n in tree.iter("node") if _node_matches(n, layout["pw_field"])), None)
-            if pw is not None:
-                _, pw_y1, _, pw_y2 = _bounds(pw)
-                cands = []
-                for n in tree.iter("node"):
-                    if "CheckBox" not in n.attrib.get("class", ""):
-                        continue
-                    if not _visible(n):
-                        continue
-                    x1, y1, x2, y2 = _bounds(n)
-                    if y1 >= pw_y2 - 20:
-                        cands.append((y1 - pw_y2, n, (x1 + x2) // 2, (y1 + y2) // 2))
-                if cands:
-                    cands.sort(key=lambda t: t[0])
-                    _, node, cx, cy = cands[0]
-                    xy = (cx, cy)
-    if node is not None and node.attrib.get("checked") == "true":
-        print("[phone_login] 자동 로그인 이미 체크됨", flush=True)
-        return
-    if xy is None:
-        ocr = ocr_texts(adb_screencap())
-        for label in ("자동로그인", "로그인상태유지"):
-            hit = next((t for t in ocr if label in t["text"].replace(" ", "")), None)
-            if hit:
-                xy = (hit["cx"], hit["cy"])
-                break
-    if xy is None:
-        print("[phone_login] 자동 로그인 체크박스를 못 찾음 — layout auto_login_check 실측 필요", flush=True)
-        return
-    tap(xy)
-    time.sleep(0.25)
-    print("[phone_login] 자동 로그인 체크 탭", flush=True)
-
-
 def fill_form(acct: dict, code: str, layout: dict, tree: ET.Element | None = None) -> str:
-    """ID/PW/캡차 입력 → 자동 로그인 체크 → 값 검증 → 로그인 탭. 실패 사유(성공 시 빈 문자열) 반환."""
+    """ID/PW/캡차 입력 → 값 검증 → 인증 상태 확인 → 로그인 탭. 실패 사유(성공 시 빈 문자열) 반환."""
     tree = fill_fast(acct, code, layout, tree)
     if tree is None:
         for name, value in (("id_field", acct["id"]), ("pw_field", acct["pw"]), ("captcha_field", code)):
@@ -498,95 +384,54 @@ def fill_form(acct: dict, code: str, layout: dict, tree: ET.Element | None = Non
         tree = inputs_ok(acct, code, layout)
         if tree is None:
             return "INPUT_MISMATCH"
-    ensure_auto_login_checked(layout, tree)
     if not cloudflare_passed():
         return "CLOUDFLARE"
-    tree = dump_tree(retries=1) or tree
-    xy = locate("login_button", layout, tree, dump_texts(tree))
-    if xy is None:
+    tree = dump_tree(retries=1)
+    if tree is None or not {"loginId", "password"}.issubset(dump_ids(tree)):
+        return "LOGIN_FORM_UNVERIFIED"
+    button = find_node_bounds(tree, {"text": "로그인", "cls": "Button"})
+    if button is None:
         return "login_button"
-    tap(xy)
+    x1, y1, x2, y2 = button
+    tap(((x1 + x2) // 2, (y1 + y2) // 2))
     return ""
 
 
-def _find_cloudflare_tap(tree: ET.Element | None) -> tuple[int, int] | None:
-    """Cloudflare '사람인지 확인' 체크 칸 좌표. dump → OCR 순."""
-    if tree is not None:
-        for n in tree.iter("node"):
-            if not _visible(n):
-                continue
-            rid = n.attrib.get("resource-id", "")
-            text = n.attrib.get("text", "")
-            desc = n.attrib.get("content-desc", "")
-            cls = n.attrib.get("class", "")
-            blob = f"{rid} {text} {desc}".lower()
-            if "cloudflare" in blob or "사람인지" in text or "확인하십시오" in text:
-                x1, y1, x2, y2 = _bounds(n)
-                return (x1 + x2) // 2, (y1 + y2) // 2
-            if "CheckBox" in cls and ("성공" not in text):
-                x1, y1, x2, y2 = _bounds(n)
-                if y1 > 400:
-                    return (x1 + x2) // 2, (y1 + y2) // 2
-        for it in dump_texts(tree):
-            t = it["text"].replace(" ", "")
-            if "사람인지확인" in t or "확인하십시오" in t or "정보보호" in t:
-                return it["cx"], it["cy"]
-    ocr = ocr_texts(adb_screencap())
-    for label in ("사람인지 확인", "사람인지확인", "확인하십시오", "I'm not a robot"):
-        hit = next((t for t in ocr if label.replace(" ", "") in t["text"].replace(" ", "")), None)
-        if hit:
-            return hit["cx"], hit["cy"]
-    return None
+def cloudflare_passed(timeout: float | None = None, user_wait: float | None = None) -> bool:
+    """Cloudflare 위젯(`cloudflare-captcha`, 2026-11-27 실측) 상태 확인. 체크 칸은 절대 누르지 않는다.
 
-
-def cloudflare_passed(timeout: float = 15, user_wait: float = 10) -> bool:
-    """로그인 폼의 Cloudflare 인증 위젯(`cloudflare-captcha`, 2026-11-27 실측).
-
-    1) 위젯 없으면 바로 True
-    2) 이미 '성공!' 이면 True
-    3) timeout 전에 자동 성공을 잠깐 기다림
-    4) 안 되면 dump/OCR 로 체크 칸을 한 번 탭 시도 → 몇 초 더 성공 대기
-    5) 그래도 안 되면 사용자 직접 체크 대기(user_wait)
-    6) 최종 실패 시 False
+    1) 위젯 없는 정상 로그인 폼 → True
+    2) 위젯이 '성공!' (자동 통과) → True
+    3) timeout 안에 자동 통과가 안 되면 AUTH_HOOK 으로 '사람 인증 필요'를 알리고 user_wait 동안
+       사용자가 폰에서 직접 체크하기를 기다린다 → '성공!' 이 보이면 자동으로 이어간다.
+    4) 그래도 안 되면 False (로그인 버튼 안 누름)
     """
-    tapped = False
-    end = time.time() + timeout
-    user_deadline = None
-
+    timeout = CF_AUTO_WAIT if timeout is None else timeout
+    user_wait = CF_USER_WAIT if user_wait is None else user_wait
+    deadline = time.monotonic() + timeout
+    manual_deadline = None
+    seen_widget = False
     while True:
         tree = dump_tree(retries=1)
-        if "cloudflare-captcha" not in dump_ids(tree):
-            return True
-        if any(t["text"].strip() == "성공!" for t in dump_texts(tree)):
-            print("[phone_login] Cloudflare 인증 '성공!' 확인", flush=True)
-            return True
-
-        now = time.time()
-
-        if now < end and not tapped:
-            time.sleep(0.4)
-            continue
-
-        if not tapped:
-            xy = _find_cloudflare_tap(tree)
-            if xy is not None:
-                print(f"[phone_login] Cloudflare 체크 칸 탭 시도 {xy}", flush=True)
-                tap(xy)
-                tapped = True
-                end = time.time() + 8
-                time.sleep(0.8)
-                continue
-            print(f"[phone_login] ★ Cloudflare 체크 칸 위치 못 찾음 — 폰에서 직접 체크해 주세요 ({user_wait:.0f}초 대기)", flush=True)
-            user_deadline = time.time() + user_wait
-            tapped = True
-            continue
-
-        if user_deadline is None:
-            print(f"[phone_login] ★ Cloudflare 체크 칸 — 폰에서 직접 체크해 주세요 ({user_wait:.0f}초 대기)", flush=True)
-            user_deadline = time.time() + user_wait
-
-        if now >= user_deadline:
-            print("[phone_login] Cloudflare 인증이 '성공!' 이 아님 — 직접 확인 필요, 로그인 안 누름", flush=True)
+        ids = dump_ids(tree)
+        valid_form = {"loginId", "password"}.issubset(ids)
+        if tree is not None and valid_form and not _empty_webview(tree):
+            if "cloudflare-captcha" in ids:
+                seen_widget = True
+                if any(t["text"].strip() == "성공!" for t in dump_texts(tree)):
+                    if manual_deadline is not None:
+                        _notify("auth_done", "Cloudflare 사람 인증 완료 확인 — 자동으로 이어갑니다")
+                    else:
+                        print("[phone_login] Cloudflare 인증 성공 확인", flush=True)
+                    return True
+            elif not seen_widget:
+                return True   # 위젯이 없는 정상 로그인 폼에서만 진행한다.
+        now = time.monotonic()
+        if manual_deadline is None and now >= deadline:
+            _notify("auth_required", f"★ Cloudflare 사람 인증 필요 — 폰에서 직접 체크해 주세요 ({user_wait:.0f}초 대기)")
+            manual_deadline = now + user_wait
+        if manual_deadline is not None and now >= manual_deadline:
+            _notify("auth_timeout", "Cloudflare 인증 완료를 확인하지 못함 — 로그인 중단")
             return False
         time.sleep(0.4)
 
@@ -630,7 +475,7 @@ def open_app() -> None:
 def tap_my_tab() -> bool:
     """하단 '마이' 탭. 탭바는 dump 에 글자가 없어(tabBar 노드 하나뿐, 실측) OCR 로 찾는다."""
     texts = ocr_texts(adb_screencap())
-    hit = next((t for t in texts if t["text"].strip() == "마이" and t["cy"] > 2000), None)
+    hit = next((t for t in texts if t["text"].strip() == "마이" and t["cy"] > adb.sy(2000)), None)
     if not hit:
         print("[phone_login] 하단 '마이' 탭 못 찾음", flush=True)
         return False
@@ -678,18 +523,32 @@ def dismiss_error(layout: dict) -> None:
         tap(xy); time.sleep(0.8)
 
 
+SAVE_FAIL_SHOTS = os.environ.get("SAVE_FAIL_SHOTS", "1") != "0"
+MAX_FAIL_SHOTS = 50
+
+
 def shot_fail(no: str, tag: str) -> None:
-    LOG_DIR.mkdir(exist_ok=True)
-    adb_screencap().save(LOG_DIR / f"phone_login_fail_{no}_{tag}_{dt.datetime.now():%H%M%S}.png")
+    """실패 화면 저장(원인 분석용). 보안 인증 화면(카드앱)은 저장하지 않고, 최근 MAX_FAIL_SHOTS 장만 남긴다."""
+    if not SAVE_FAIL_SHOTS:
+        return
+    try:
+        if sr.is_secure():
+            return
+        shots = LOG_DIR / "fail_shots"
+        shots.mkdir(parents=True, exist_ok=True)
+        adb_screencap().save(shots / f"fail_{no}_{tag}_{dt.datetime.now():%m%d_%H%M%S}.png")
+        old = sorted(shots.glob("fail_*.png"), key=lambda p: p.stat().st_mtime)
+        for p in old[:-MAX_FAIL_SHOTS]:
+            p.unlink(missing_ok=True)
+    except Exception as e:
+        print(f"[phone_login] 실패 화면 저장 못 함: {type(e).__name__}", flush=True)
 
 
 def attempt(no: str, acct: dict, layout: dict) -> str:
-    """1회 시도. 반환: LOGGED_IN / NO_CAPTCHA(제출 안 함) / MISSING:<요소> / 실패 화면명."""
-    t0 = time.time()
+    """1회 시도. 반환: LOGGED_IN / CAPTCHA_UNSUPPORTED(제출 안 함) / MISSING:<요소> / 실패 화면명."""
     code, tree = solve_captcha(layout)
-    print(f"[phone_login] 캡차 판독 {time.time() - t0:.1f}s", flush=True)
     if code is None:
-        return "NO_CAPTCHA"
+        return "CAPTCHA_UNSUPPORTED"
     t0 = time.time()
     missing = fill_form(acct, code, layout, tree)
     print(f"[phone_login] 입력·제출 {time.time() - t0:.1f}s", flush=True)
@@ -709,7 +568,7 @@ def login_form_after_logout() -> str:
     다시 누를 땐 OCR 로 '마이' 글자가 보일 때만 누른다."""
     if FORM_OPEN:
         return "LOGIN_FORM"
-    tap(MY_TAB)
+    tap(adb.pt(MY_TAB))
     for i in range(5):
         if "loginId" in dump_ids(dump_tree(retries=2)):
             return "LOGIN_FORM"
@@ -721,7 +580,7 @@ def login_form_after_logout() -> str:
 def open_login_form() -> str:
     """로그인 폼을 띄운다. 반환: LOGIN_FORM / ALREADY_LOGGED_IN / 그 밖의 화면명."""
     # 앱이 이미 앞에 있으면(로그아웃 직후 등) 다시 열지 않고 바로 마이 탭으로 판정한다
-    if "com.oliveyoung" in shell("dumpsys", "window", capture_output=True).split("mCurrentFocus", 1)[-1].split("\n", 1)[0]:
+    if "com.oliveyoung" in adb.focus():
         logged = is_logged_in()
         if logged is not None:
             return "ALREADY_LOGGED_IN" if logged else "LOGIN_FORM"
@@ -737,7 +596,9 @@ def open_login_form() -> str:
 
 def login(no: str, after_logout: bool = False) -> dict:
     """no번 계정 앱 로그인. 홈이면 마이 탭으로 로그인 폼을 연다. 다른 계정 로그인 상태면 멈춘다(먼저 logout)."""
+    global LAST_NICK
     acct, layout = load_account(no), load_layout()
+    LAST_NICK = ""   # 이전 계정 닉네임으로 일치 판정하지 않게
     start = login_form_after_logout() if after_logout else open_login_form()
     if start != "LOGIN_FORM":
         return {"ok": False, "status": f"NOT_LOGIN_SCREEN:{start}"}
@@ -746,14 +607,27 @@ def login(no: str, after_logout: bool = False) -> dict:
         r = attempt(no, acct, layout)
         print(f"[phone_login] {no}번 시도 {i}/{MAX_ATTEMPTS} → {r}", flush=True)
         if r == "LOGGED_IN":
+            ok, why = account_matches(acct)
+            if not ok:
+                return {"ok": False, "status": f"ACCOUNT_MISMATCH:{why}", "attempts": i}
             return {"ok": True, "status": "LOGGED_IN", "attempts": i}
-        if r.startswith("MISSING:"):
-            return {"ok": False, "status": r}          # 실측 문제 — 재시도해도 같다
-        consec = consec + 1 if r != "NO_CAPTCHA" else consec
+        if r.startswith("MISSING:") or r == "CAPTCHA_UNSUPPORTED":
+            return {"ok": False, "status": r, "attempts": i}   # 재시도해도 같다
+        consec += 1
         if consec >= MAX_CONSEC_FAIL:
             return {"ok": False, "status": f"STOP_CONSEC_FAIL:{r}", "attempts": i}
-        refresh_captcha(layout)
     return {"ok": False, "status": "MAX_ATTEMPTS", "attempts": MAX_ATTEMPTS}
+
+
+def account_matches(acct: dict) -> tuple[bool, str]:
+    """마이페이지 닉네임(앞부분 + 마스킹 '*')이 계정 아이디와 맞는지. 닉네임을 못 읽었으면 불일치로 본다."""
+    nick = LAST_NICK.strip()
+    if not nick:
+        return False, "닉네임 확인 불가"
+    head = nick.split("*")[0]
+    if head and not acct["id"].startswith(head):
+        return False, "닉네임이 계정 아이디와 다름"
+    return True, ""
 
 
 def wait_my_tab(timeout: float = 12) -> bool:
@@ -761,7 +635,7 @@ def wait_my_tab(timeout: float = 12) -> bool:
     end = time.time() + timeout
     while time.time() < end:
         texts = ocr_texts(adb_screencap())
-        if any(t["text"].strip() == "마이" and t["cy"] > 2000 for t in texts):
+        if any(t["text"].strip() == "마이" and t["cy"] > adb.sy(2000) for t in texts):
             return True
         close = [t for t in texts if t["text"].strip() == "닫기"]
         if close:
@@ -772,7 +646,7 @@ def wait_my_tab(timeout: float = 12) -> bool:
 
 def open_my_page(tries: int = 3) -> str:
     """마이페이지가 실제로 뜬 것을 확인한다. 반환: MY / LOGGED_OUT / FAIL. 안 떴으면 스크롤하지 않고 다시 누른다."""
-    focus = shell("dumpsys", "window", capture_output=True).split("mCurrentFocus", 1)[-1].split("\n", 1)[0]
+    focus = adb.focus()
     wait = 2.5                # 앱이 이미 떠 있으면 탭이 바로 보인다
     if "com.oliveyoung" not in focus:
         shell("monkey", "-p", "com.oliveyoung", "-c", "android.intent.category.LAUNCHER", "1", capture_output=True)
@@ -801,10 +675,10 @@ def logout() -> bool:
         return FORM_OPEN
     for _ in range(6):
         for _ in range(3):
-            shell("input", "swipe", "540", "1900", "540", "300", "120")
+            shell("input", "swipe", *map(str, (*adb.pt((540, 1900)), *adb.pt((540, 300)))), "120")
         tree = dump_tree()
         node = next((n for n in (tree.iter('node') if tree is not None else [])
-                     if n.attrib.get("text") == "로그아웃" and _visible(n) and _bounds(n)[3] < 2001), None)
+                     if n.attrib.get("text") == "로그아웃" and _visible(n) and _bounds(n)[3] < adb.sy(2001)), None)
         if node is not None:
             x1, y1, x2, y2 = _bounds(node)
             tap(((x1 + x2) // 2, (y1 + y2) // 2))

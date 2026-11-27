@@ -1,8 +1,22 @@
+# 민감 정보 — 절대 커밋 금지
 accounts.json
+config/accounts.json
+phone_auto/card_secrets.json
+gemini_key.json
+*.secret.json
+.env
+
+# 실행 산출물
 sessions/
 logs/
-gemini_key.json
-phone_auto/card_secrets.json
-__pycache__/
+database/
 phone_auto/_tmp/
+phone_auto/oy_login_layout.json
+
+# 설치물
+.venv/
+models/
+__pycache__/
+.pytest_cache/
 .DS_Store
+.claude/settings.local.json

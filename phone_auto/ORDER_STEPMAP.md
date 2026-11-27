@@ -137,3 +137,13 @@
   `cloudflare_passed` 는 15초 자동 통과를 기다리고, 안 되면 `★ 폰에서 직접 체크해 주세요` 를 찍고 10초 더 기다린다(사용자 지시).
   처음엔 대기 전환 전에 바로 실패로 빠지는 버그가 있었음 → 고침, 재실측 전.
 - 로그인 빠른 경로에서 `입력값 불일치: pw_field` 가 자주 나오지만 느린 경로가 복구해 로그인은 성공한다.
+
+## 14. 2026-11-27 리팩토링 (폰 미연결 상태에서 작업 — 아래는 전부 폰 미실측)
+- OCR 이 Apple Vision → PP-OCRv6 small + korean PP-OCRv5(ONNX) 로 바뀌었다. `ocr_texts` 반환 형식(text,cx,cy,src)은 같고 confidence/box/bbox 가 추가됐다.
+  글자 판정이 정확일치(`t["text"].strip() == "마이"`)인 곳이 많아 **실제 앱 화면에서 새 OCR 이 같은 글자를 내는지 확인 필요**(마이·닫기·바로구매·결제하기·로카페이·앱카드).
+- 고정 좌표·y 기준(MY_TAB, 장바구니 아이콘, 스와이프, y≥1800/2000 등)은 1080x2400 실측값을 `adb_manager.pt/sx/sy` 로 환산한다. 1080x2400 기기에선 값이 그대로다.
+- `uiautomator dump` 는 adb 호출 1번(`exec-out "uiautomator dump … && cat …"`)으로 합쳤다.
+- 수량 2개 이상: `threads_buy.set_quantity` 가 `수량 증가`(content-desc) 를 누르고 EditText 값으로 확인 — ⚠️ 미실측.
+- 결제 인증 직접 입력(PIN_MODE=manual): 롯데는 `bt_appcard_pay_request_complete_confirm`, 현대는 올영 복귀를 기다린다 — ⚠️ 미실측.
+- 배송지 확인(필수, 사용자 지시 2026-11-28): 작업마다 수령인 이름 또는 주소 일부를 받아 `addrSummaryName` 또는 주소처럼 생긴 주문서 글자(숫자+로/길/동…)에서 찾는다.
+  없으면 결제하기를 누르지 않는다. ⚠️ 주소 줄 resource-id 는 미실측 — dry-run 로그의 `배송지 확인 통과: …` 로 확인할 것. 상품명·옵션명 확인은 넣지 않는다(링크로 이미 정해짐).

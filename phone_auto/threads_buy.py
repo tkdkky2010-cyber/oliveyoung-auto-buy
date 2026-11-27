@@ -8,7 +8,7 @@
 <링크> = 쓰레드 글 주소, 또는 올영 상품 주소(바로 올영 앱으로 연다). [옵션번호] = 옵션이 여러 개일 때 몇 번째(1부터).
 옵션이 1개면 번호 없이 그걸 산다. 여러 개인데 번호가 없으면 옵션 목록을 보여주고 멈춘다 (사용자 지시 2026-11-27).
 
-사용:  python3 phone_auto/threads_buy.py prepare <계정번호> <lotte|hyundai> <링크> [옵션번호]   # 결제하기 직전까지
+사용:  python phone_auto/threads_buy.py prepare <계정번호> <lotte|hyundai> <링크> [옵션번호]   # 결제하기 직전까지
        python3 phone_auto/threads_buy.py pay <계정번호> <lotte|hyundai> <쓰레드링크>      # 주문완료까지 (실제 결제)
        python3 phone_auto/threads_buy.py pay-all <1-10|1,3,5> <lotte|hyundai> <쓰레드링크> # 계정마다 로그아웃→로그인→구매 반복
 """
@@ -19,6 +19,7 @@ import shlex
 import sys
 import time
 
+import adb_manager as adb
 import phone_login as pl
 import phone_pay as pp
 from phone_pay import PayStop, log
@@ -33,7 +34,9 @@ def screen_texts() -> list[dict]:
 
 
 def find_text(texts: list[dict], word: str, min_y: int = 0) -> dict | None:
-    return next((t for t in texts if t["text"].strip() == word and t["cy"] >= min_y), None)
+    """min_y 는 실측(2400 높이) 기준 — 기기 해상도로 환산해 비교한다."""
+    y = adb.sy(min_y)
+    return next((t for t in texts if t["text"].strip() == word and t["cy"] >= y), None)
 
 
 def open_threads(url: str) -> None:
@@ -191,14 +194,14 @@ def option_name(text: str) -> str:
 def option_rows(tree) -> list:
     """옵션 목록 행(실측 2026-11-27): Button, x 84~995, 글자에 가격('원'). 화면 밖 행은 높이 0."""
     return [n for n in pp.nodes(tree) if n.get("class", "").endswith("Button") and "원" in n.get("text", "")
-            and pl._bounds(n)[0] < 100 and pl._bounds(n)[2] > 900]
+            and pl._bounds(n)[0] < adb.sx(100) and pl._bounds(n)[2] > adb.sx(900)]
 
 
 def shown(tree, cls: str, text: str | None = None, min_y: int = 0):
     """높이가 있는(실제로 보이는) cls 노드. 화면 밖 노드는 높이 0 으로 dump 에 남아 있다 (실측)."""
     for n in pp.nodes(tree):
         x1, y1, x2, y2 = pl._bounds(n)
-        if n.get("class", "").endswith(cls) and y2 - y1 > 20 and y1 >= min_y and (text is None or n.get("text") == text):
+        if n.get("class", "").endswith(cls) and y2 - y1 > 20 and y1 >= adb.sy(min_y) and (text is None or n.get("text") == text):
             return n
     return None
 
@@ -216,10 +219,10 @@ def scroll_option_into_view(index: int):
         if index > len(rows):
             raise PayStop(f"옵션 {index}번 없음 (옵션 {len(rows)}개)")
         x1, y1, x2, y2 = pl._bounds(rows[index - 1])
-        if y2 - y1 >= 100 and y1 >= 1219 and y2 <= 2200:
+        if y2 - y1 >= adb.sy(100) and y1 >= adb.sy(1219) and y2 <= adb.sy(2200):
             return rows[index - 1]
-        down = y2 - y1 < 100 or y2 > 2200
-        pl.shell("input", "swipe", "540", "1900" if down else "1400", "540", "1400" if down else "1900", "300")
+        down = y2 - y1 < adb.sy(100) or y2 > adb.sy(2200)
+        pp.swipe((540, 1900 if down else 1400), (540, 1400 if down else 1900), 300)
     raise PayStop(f"옵션 {index}번을 화면에 띄우지 못함")
 
 
@@ -241,14 +244,51 @@ def choose_option(tree, option: int | None) -> None:
     log(f"옵션 {index}번 선택: {names[index - 1]}")
 
 
-def buy_now(option: int | None = None):
-    """상품 페이지 하단 '바로구매'(실측: '구매하기' 버튼은 없음) → 옵션 목록이면 고르기 → '바로구매' → 주문서."""
+def quantity_value(tree) -> int | None:
+    box = shown(tree, "EditText")
+    if box is None:
+        return None
+    digits = re.sub(r"\D", "", box.get("text", ""))
+    return int(digits) if digits else None
+
+
+def set_quantity(tree, quantity: int):
+    """수량 EditText 옆 '수량 증가'(content-desc, 2026-11-27 dump 실측)를 눌러 맞추고 값으로 확인한다.
+    ⚠️ 2개 이상 구매는 폰 미실측 — 버튼이나 값이 예상과 다르면 탭을 멈춘다."""
+    if quantity == 1 and quantity_value(tree) in (None, 1):
+        return tree
+    if quantity < 1 or quantity > 10:
+        raise PayStop(f"구매 수량 범위 밖: {quantity} (1~10)")
+    for _ in range(quantity + 3):
+        cur = quantity_value(tree)
+        if cur is None:
+            raise PayStop("수량 칸을 찾지 못함")
+        if cur == quantity:
+            log(f"수량 {quantity}")
+            return tree
+        if cur > quantity:
+            raise PayStop(f"수량이 목표보다 큼({cur} > {quantity}) — 멈춤")
+        plus = next((n for n in pp.nodes(tree) if n.get("content-desc", "") == "수량 증가"
+                     and pl._bounds(n)[3] - pl._bounds(n)[1] > 20), None)
+        if plus is None:
+            raise PayStop("'수량 증가' 버튼을 찾지 못함")
+        pl.tap(pp.center(plus))
+        tree = pp.wait_tree(lambda t: quantity_value(t) not in (None, cur), 4, "수량 변경")
+    raise PayStop("수량을 맞추지 못함")
+
+
+def buy_now(option: int | None = None, quantity: int = 1):
+    """상품 페이지 하단 '바로구매'(실측: '구매하기' 버튼은 없음) → 옵션 목록이면 고르기 → 수량 → '바로구매' → 주문서."""
     tap_word("바로구매", 10, min_y=1800)
     tree = pp.wait_tree(lambda t: bool(option_rows(t)) or selected_ready(t) or bool(pp.text_of(t, "addrSummaryName")),
                         10, "바로구매 이후 화면")
     if option_rows(tree):
         choose_option(tree, option)
         tree = pl.dump_tree(retries=2)
+    if not pp.text_of(tree, "addrSummaryName"):
+        tree = set_quantity(tree, quantity)
+    elif quantity != 1:
+        raise PayStop("수량 선택 화면 없이 주문서로 넘어감 — 수량 2개 이상은 확인 불가")
     if not pp.text_of(tree, "addrSummaryName"):
         button = shown(tree, "Button", "바로구매", min_y=1800)
         if button is None:
@@ -262,26 +302,19 @@ def buy_now(option: int | None = None):
     return tree
 
 
-def prepare(no: str, card: str, url: str, option: int | None = None) -> tuple:
+def prepare(no: str, card: str, url: str, option: int | None = None, quantity: int = 1) -> tuple:
     """결제하기 버튼 직전까지. 주문서부터는 phone_pay.prepare 와 같은 순서."""
     relogin(no)
     open_product(no, url)
-    pp.tap_cjone(buy_now(option))
-    tree = pp.select_card(card, pp.payment_area())
-    pp.agree_all(tree)
-    button = pp.find(tree, rid="btnPay")
-    amount = pp.number(button.get("text", ""))
-    log(f"결제 준비 완료: {amount:,}원")
-    return amount, pp.center(button)
+    pp.tap_cjone(buy_now(option, quantity))
+    return pp.prepare_payment(card)
 
 
-def pay(no: str, card: str, url: str, option: int | None = None) -> str | None:
-    amount, button = prepare(no, card, url, option)
+def pay(no: str, card: str, url: str, option: int | None = None, quantity: int = 1) -> str | None:
+    amount, button = prepare(no, card, url, option, quantity)
     if not pp.pay_by_card(card, button, amount):
         return None
-    order = pp.wait_order_complete(amount)
-    log(f"주문 완료: {order} {amount:,}원")
-    return order
+    return pp.finish_order(amount)
 
 
 def parse_accounts(spec: str) -> list[str]:

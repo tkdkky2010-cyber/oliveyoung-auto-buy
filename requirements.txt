@@ -1,0 +1,12 @@
+# Python 3.11 기준. Windows 10/11 · macOS(Apple Silicon/Intel) · Linux x86_64 휠 존재 확인(2026-11-27, pip download --python-version 3.11).
+# onnxruntime 1.23.2 = macOS Intel 휠이 있는 마지막 버전. PP-OCRv6(opset 14)·korean PP-OCRv5(opset 7) 로딩 확인.
+numpy==2.2.6
+onnxruntime==1.23.2
+opencv-python-headless==4.13.0.92; sys_platform != "darwin" or platform_machine != "x86_64"
+opencv-python-headless==4.12.0.88; sys_platform == "darwin" and platform_machine == "x86_64"
+pillow==12.1.0
+PyYAML==6.0.3
+fastapi==0.165.0
+starlette==1.10.0
+pydantic==2.14.4
+uvicorn==0.54.0

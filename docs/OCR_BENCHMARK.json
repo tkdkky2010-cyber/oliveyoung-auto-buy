@@ -1,0 +1,205 @@
+{
+ "env": {
+  "os": "macOS-15.7.5-arm64-arm-64bit-Mach-O",
+  "machine": "arm64",
+  "python": "3.13.14",
+  "cpu_count": 8,
+  "onnxruntime": "1.23.2",
+  "fonts": [
+   "AppleSDGothicNeo.ttc#0",
+   "AppleSDGothicNeo.ttc#2",
+   "AppleSDGothicNeo.ttc#6",
+   "AppleGothic.ttf#0"
+  ]
+ },
+ "models": {
+  "PP-OCRv6_small_det": {
+   "synthetic": {
+    "korean": {
+     "lines": 926,
+     "line_exact": 99.24,
+     "char_acc": 99.9,
+     "missed": 0,
+     "center_err_px_mean": 1.9
+    },
+    "numeric": {
+     "lines": 465,
+     "line_exact": 100.0,
+     "char_acc": 100.0,
+     "missed": 0,
+     "center_err_px_mean": 2.4
+    }
+   },
+   "synthetic_full_ms_mean": 707.7,
+   "real": {
+    "images": 18,
+    "full": {
+     "mean_ms": 956.8,
+     "p95_ms": 1227.3,
+     "max_ms": 1460.8
+    },
+    "region_bottom400": {
+     "mean_ms": 209.2,
+     "p95_ms": 556.6,
+     "max_ms": 575.3
+    }
+   },
+   "worst": [
+    {
+     "ref": "라운드랩 1025 독도 토너",
+     "hyp": "라운드램 1025 독도 토너",
+     "numeric": false,
+     "exact": false,
+     "cer": 0.08333333333333333,
+     "center_err": 4.0
+    },
+    {
+     "ref": "라운드랩 1025 독도 토너",
+     "hyp": "라운드램 1025 독도 토너",
+     "numeric": false,
+     "exact": false,
+     "cer": 0.08333333333333333,
+     "center_err": 1.5
+    },
+    {
+     "ref": "라운드랩 1025 독도 토너",
+     "hyp": "라운드램 1025 독도 토너",
+     "numeric": false,
+     "exact": false,
+     "cer": 0.08333333333333333,
+     "center_err": 1.5
+    },
+    {
+     "ref": "CJ ONE 포인트는 10P 단위로 사용하실 수 있어요.",
+     "hyp": "CJ ONE 포인트는 10P 단위로 사용하실 수 있어요",
+     "numeric": false,
+     "exact": false,
+     "cer": 0.041666666666666664,
+     "center_err": 5.5
+    },
+    {
+     "ref": "CJ ONE 포인트는 10P 단위로 사용하실 수 있어요.",
+     "hyp": "CJ ONE 포인트는 1OP 단위로 사용하실 수 있어요.",
+     "numeric": false,
+     "exact": false,
+     "cer": 0.041666666666666664,
+     "center_err": 2.5
+    },
+    {
+     "ref": "CJ ONE 포인트는 10P 단위로 사용하실 수 있어요.",
+     "hyp": "CJ ONE 포인트는 1OP 단위로 사용하실 수 있어요.",
+     "numeric": false,
+     "exact": false,
+     "cer": 0.041666666666666664,
+     "center_err": 2.5
+    },
+    {
+     "ref": "CJ ONE 포인트는 10P 단위로 사용하실 수 있어요.",
+     "hyp": "CJ ONE 포인트는 1OP 단위로 사용하실 수 있어요.",
+     "numeric": false,
+     "exact": false,
+     "cer": 0.041666666666666664,
+     "center_err": 3.0
+    }
+   ]
+  },
+  "PP-OCRv6_medium_det": {
+   "synthetic": {
+    "korean": {
+     "lines": 926,
+     "line_exact": 99.46,
+     "char_acc": 99.929,
+     "missed": 0,
+     "center_err_px_mean": 2.4
+    },
+    "numeric": {
+     "lines": 465,
+     "line_exact": 99.35,
+     "char_acc": 99.935,
+     "missed": 0,
+     "center_err_px_mean": 3.2
+    }
+   },
+   "synthetic_full_ms_mean": 4360.3,
+   "real": {
+    "images": 18,
+    "full": {
+     "mean_ms": 5217.3,
+     "p95_ms": 5910.2,
+     "max_ms": 5987.7
+    },
+    "region_bottom400": {
+     "mean_ms": 883.1,
+     "p95_ms": 1180.2,
+     "max_ms": 1260.0
+    }
+   },
+   "worst": [
+    {
+     "ref": "- 1,810",
+     "hyp": "1,810",
+     "numeric": true,
+     "exact": false,
+     "cer": 0.16666666666666666,
+     "center_err": 14.0
+    },
+    {
+     "ref": "- 6,924",
+     "hyp": "6,924",
+     "numeric": true,
+     "exact": false,
+     "cer": 0.16666666666666666,
+     "center_err": 17.5
+    },
+    {
+     "ref": "- 7,010",
+     "hyp": "7,010",
+     "numeric": true,
+     "exact": false,
+     "cer": 0.16666666666666666,
+     "center_err": 8.0
+    },
+    {
+     "ref": "라운드랩 1025 독도 토너",
+     "hyp": "라운드램 1025 독도 토너",
+     "numeric": false,
+     "exact": false,
+     "cer": 0.08333333333333333,
+     "center_err": 2.5
+    },
+    {
+     "ref": "라운드랩 1025 독도 토너",
+     "hyp": "라운드램 1025 독도 토너",
+     "numeric": false,
+     "exact": false,
+     "cer": 0.08333333333333333,
+     "center_err": 3.0
+    },
+    {
+     "ref": "CJ ONE 포인트는 10P 단위로 사용하실 수 있어요.",
+     "hyp": "CJ ONE 포인트는 1OP 단위로 사용하실 수 있어요.",
+     "numeric": false,
+     "exact": false,
+     "cer": 0.041666666666666664,
+     "center_err": 3.5
+    },
+    {
+     "ref": "CJ ONE 포인트는 10P 단위로 사용하실 수 있어요.",
+     "hyp": "CJ ONE 포인트는 1OP 단위로 사용하실 수 있어요.",
+     "numeric": false,
+     "exact": false,
+     "cer": 0.041666666666666664,
+     "center_err": 4.5
+    },
+    {
+     "ref": "CJ ONE 포인트는 10P 단위로 사용하실 수 있어요.",
+     "hyp": "CJ ONE 포인트는 1OP 단위로 사용하실 수 있어요.",
+     "numeric": false,
+     "exact": false,
+     "cer": 0.041666666666666664,
+     "center_err": 4.0
+    }
+   ]
+  }
+ }
+}
