@@ -36,9 +36,14 @@
 python3 phone_auto/phone_pay.py relogin-to-pin <계정번호> lotte   # 로그아웃 → 로그인 → PIN 화면에서 멈춤 (입력 안 함)
 python3 phone_auto/phone_pay.py relogin-pay <계정번호> lotte      # 로그아웃 → 로그인 → 주문 완료까지 (실제 결제)
 python3 phone_auto/phone_pay.py pay <계정번호> lotte              # 이미 로그인한 상태에서 주문 완료까지
+# 카드 자리에 hyundai 를 쓰면 현대카드 앱(The CJ-M Edition2)으로 결제 — 2026-11-27 실결제 성공 (ORDER_STEPMAP 13)
 ```
 
-## 쓰레드 링크 → 올영 앱 구매 (⚠️ 실측 전 초안)
+## 쓰레드 링크 / 올영 상품 주소 → 올영 앱 구매 (2026-11-27 현대카드 실결제 성공)
+
+<링크> 자리엔 쓰레드 글 주소나 올영 상품 주소를 넣는다. 옵션이 여러 개면 끝에 [옵션번호](1부터)를 붙인다.
+실행할 때 `ANDROID_SERIAL=adb-RFCNC0WRL9Z-iXGAm4._adb-tls-connect._tcp` 를 앞에 붙인다(무선 adb, IP 주소는 끊긴다).
+Cloudflare `사람인지 확인하십시오` 칸이 뜨면 로그에 `★` 가 찍히고 10초 기다린다 — 그 사이 폰에서 체크.
 
 ```bash
 python3 phone_auto/threads_buy.py prepare <계정번호> lotte <쓰레드링크>   # 결제하기 직전까지

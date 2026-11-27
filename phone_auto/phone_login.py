@@ -182,11 +182,26 @@ def dump_tree(retries: int = 3) -> ET.Element | None:
     """uiautomator dump — 화면 전환 중엔 'could not get idle state' 로 실패하므로 몇 번 재시도."""
     for _ in range(retries):
         try:
-            return get_ui_hierarchy()
+            return fill_empty_webview(get_ui_hierarchy())
         except (subprocess.CalledProcessError, ET.ParseError) as e:
             print(f"   [dump] 실패, 재시도: {e}", flush=True)
             time.sleep(0.7)
     return None
+
+
+def _empty_webview(tree: ET.Element) -> bool:
+    return any(n.attrib.get("class") == "android.webkit.WebView" and _visible(n) and len(n) == 0
+               for n in tree.iter("node"))
+
+
+def fill_empty_webview(tree: ET.Element, extra: int = 2) -> ET.Element:
+    """2026-11-27 실측: dump 가 보이는 WebView 를 **자식 0개**(뼈대 14KB)로 줄 때가 잦다 — 바로 다시 찍으면 290개.
+    이 상태면 마이페이지 닉네임·로그아웃 같은 WebView 글자를 못 봐 FAIL 로 빠진다 → 최대 extra 번 다시 찍는다."""
+    for _ in range(extra):
+        if not _empty_webview(tree):
+            break
+        tree = get_ui_hierarchy()
+    return tree
 
 
 def _visible(node: ET.Element) -> bool:
@@ -335,6 +350,9 @@ def save_captcha(crop: Image.Image, answer: str | None) -> None:
 def solve_captcha(layout: dict) -> tuple[str | None, ET.Element | None]:
     """캡차 답과, 입력칸 위치에 다시 쓸 dump 트리."""
     tree = dump_tree()      # dump 가 끝난 뒤 찍어야 캡차 이미지가 로드돼 있다 (먼저 찍으면 빈 칸 → NONE, 실측)
+    if find_node_bounds(tree, layout["captcha_field"]) is None and "loginId" in dump_ids(tree):
+        print("[phone_login] 캡차 칸 없음 → 아이디·비번만 입력 (사용자 지시 2026-11-27)", flush=True)
+        return "", tree     # "" = 캡차 없음. None = 캡차는 있는데 못 읽음
     img = adb_screencap()
     crop = crop_captcha(img, tree, layout)
     if crop is None:
@@ -360,7 +378,7 @@ def fill_fast(acct: dict, code: str, layout: dict, tree: ET.Element | None) -> E
     if tree is None:
         return None
     spots = {}
-    for name in ("id_field", "pw_field", "captcha_field"):
+    for name in ("id_field", "pw_field", "captcha_field")[:3 if code else 2]:
         node = next((n for n in tree.iter('node') if _node_matches(n, layout[name])), None)
         if node is None or not _visible(node):
             print(f"[phone_login] 빠른 입력 불가: {name}", flush=True)
@@ -379,7 +397,8 @@ def fill_fast(acct: dict, code: str, layout: dict, tree: ET.Element | None) -> E
         t1 = time.time()
         hide_keyboard()
         t2 = time.time()
-        shell(typed("captcha_field", code))
+        if code:
+            shell(typed("captcha_field", code))
     except subprocess.CalledProcessError:
         raise RuntimeError("로그인 입력 중 adb 실패") from None
     t3 = time.time()
@@ -406,7 +425,9 @@ def inputs_ok(acct: dict, code: str, layout: dict) -> ET.Element | None:
     dump 는 비번도 평문으로 주므로 메모리에서만 비교, 출력 안 함."""
     hide_keyboard()
     tree = dump_tree()
-    want = {"id_field": acct["id"], "pw_field": acct["pw"], "captcha_field": code}
+    want = {"id_field": acct["id"], "pw_field": acct["pw"]}
+    if code:
+        want["captcha_field"] = code
     for name, value in want.items():
         node = next((n for n in (tree.iter('node') if tree is not None else []) if _node_matches(n, layout[name])), None)
         if node is None or node.attrib.get("text", "") != value:
@@ -420,16 +441,40 @@ def fill_form(acct: dict, code: str, layout: dict, tree: ET.Element | None = Non
     tree = fill_fast(acct, code, layout, tree)
     if tree is None:
         for name, value in (("id_field", acct["id"]), ("pw_field", acct["pw"]), ("captcha_field", code)):
+            if name == "captcha_field" and not code:
+                continue
             if not fill_field(name, value, layout):
                 return name
         tree = inputs_ok(acct, code, layout)
         if tree is None:
             return "INPUT_MISMATCH"
+    if not cloudflare_passed():
+        return "CLOUDFLARE"
     xy = locate("login_button", layout, tree, dump_texts(tree))
     if xy is None:
         return "login_button"
     tap(xy)
     return ""
+
+
+def cloudflare_passed(timeout: float = 15, user_wait: float = 10) -> bool:
+    """로그인 폼의 Cloudflare 인증 위젯(`cloudflare-captcha`, 2026-11-27 실측)이 스스로 '성공!' 을 띄울 때까지 기다린다.
+    위젯이 없으면 바로 True. timeout 안에 성공이 안 뜨면 '사람인지 확인' 체크 칸이
+    뜬 것 — 사용자가 폰에서 직접 체크하도록 user_wait 초 더 기다린다(사용자 지시 2026-11-27). 그래도 안 되면 False."""
+    end, asked = time.time() + timeout, False
+    while True:
+        tree = dump_tree(retries=1)
+        if "cloudflare-captcha" not in dump_ids(tree):
+            return True
+        if any(t["text"].strip() == "성공!" for t in dump_texts(tree)):
+            print("[phone_login] Cloudflare 인증 '성공!' 확인", flush=True)
+            return True
+        if time.time() > end and not asked:
+            print(f"[phone_login] ★ Cloudflare 체크 칸 — 폰에서 직접 체크해 주세요 ({user_wait:.0f}초 대기)", flush=True)
+            end, asked = time.time() + user_wait, True
+        elif time.time() > end:
+            print("[phone_login] Cloudflare 인증이 '성공!' 이 아님 — 직접 확인 필요, 로그인 안 누름", flush=True)
+            return False
 
 
 def hide_keyboard() -> None:
@@ -529,7 +574,7 @@ def attempt(no: str, acct: dict, layout: dict) -> str:
     t0 = time.time()
     code, tree = solve_captcha(layout)
     print(f"[phone_login] 캡차 판독 {time.time() - t0:.1f}s", flush=True)
-    if not code:
+    if code is None:
         return "NO_CAPTCHA"
     t0 = time.time()
     missing = fill_form(acct, code, layout, tree)

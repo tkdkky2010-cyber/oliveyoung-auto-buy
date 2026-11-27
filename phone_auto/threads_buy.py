@@ -5,13 +5,17 @@
 로그인: 시작할 때 올영 앱을 켜서 지금 계정을 무조건 로그아웃 → accounts.json 의 <계정번호> 로 로그인 (사용자 지시 2026-11-18).
 링크로 들어갔는데 홈(또는 로그인 폼)이 뜨면 올영 앱을 끄고 쓰레드부터 다시 연다(사용자 지시 2026-11-18).
 
-사용:  python3 phone_auto/threads_buy.py prepare <계정번호> <lotte|hyundai> <쓰레드링크>   # 결제하기 직전까지
-       python3 phone_auto/threads_buy.py pay <계정번호> lotte <쓰레드링크>                # 주문완료까지 (실제 결제)
-       python3 phone_auto/threads_buy.py pay-all <1-10|1,3,5> lotte <쓰레드링크>         # 계정마다 로그아웃→로그인→구매 반복
+<링크> = 쓰레드 글 주소, 또는 올영 상품 주소(바로 올영 앱으로 연다). [옵션번호] = 옵션이 여러 개일 때 몇 번째(1부터).
+옵션이 1개면 번호 없이 그걸 산다. 여러 개인데 번호가 없으면 옵션 목록을 보여주고 멈춘다 (사용자 지시 2026-11-27).
+
+사용:  python3 phone_auto/threads_buy.py prepare <계정번호> <lotte|hyundai> <링크> [옵션번호]   # 결제하기 직전까지
+       python3 phone_auto/threads_buy.py pay <계정번호> <lotte|hyundai> <쓰레드링크>      # 주문완료까지 (실제 결제)
+       python3 phone_auto/threads_buy.py pay-all <1-10|1,3,5> <lotte|hyundai> <쓰레드링크> # 계정마다 로그아웃→로그인→구매 반복
 """
 from __future__ import annotations
 
 import re
+import shlex
 import sys
 import time
 
@@ -36,8 +40,19 @@ def open_threads(url: str) -> None:
     """링크를 VIEW 인텐트로 연다. 쓰레드 앱이 있으면 앱이, 없으면 브라우저가 받는다(미실측)."""
     if not re.match(r"https://(www\.)?threads\.(net|com)/", url):
         raise PayStop("쓰레드 링크가 아님")
-    pl.shell("am", "start", "-a", "android.intent.action.VIEW", "-d", url, capture_output=True)
+    pl.shell("am", "start", "-a", "android.intent.action.VIEW", "-d", shlex.quote(url), capture_output=True)
     log("쓰레드 열기")
+
+
+def is_oy_url(url: str) -> bool:
+    return bool(re.match(r"https://([a-z]+\.)?(oliveyoung\.co\.kr|oy\.run)/", url))
+
+
+def open_oy_direct(url: str, timeout: float = 15) -> None:
+    """쓰레드 글이 아니라 올영 상품 주소를 받았을 때 — VIEW 인텐트를 올영 앱이 바로 받는다 (실측 2026-11-27)."""
+    pl.shell("am", "start", "-a", "android.intent.action.VIEW", "-d", shlex.quote(url), capture_output=True)
+    log("올영 상품 주소 열기")
+    pp.wait_focus(OY_PACKAGE, timeout)
 
 
 def login_on_form(no: str) -> None:
@@ -52,7 +67,9 @@ def login_on_form(no: str) -> None:
 
 def relogin(no: str) -> None:
     """올영 앱을 켜서 지금 계정을 무조건 로그아웃 → no번 로그인 (사용자 지시 2026-11-18).
-    이미 로그아웃 상태면 logout() 이 로그인 폼을 보고 FORM_OPEN 을 켠다. 마이 탭 닉네임으로 계정 확인."""
+    이미 로그아웃 상태면 logout() 이 로그인 폼을 보고 FORM_OPEN 을 켠다. 마이 탭 닉네임으로 계정 확인.
+    먼저 앱을 강제 종료해 홈에서 시작한다 — 주문서·상품 페이지엔 하단 탭이 없어 뒤로가기 5번으로 마이 탭에 못 닿았다(2026-11-27 실측)."""
+    pl.shell("am", "force-stop", OY_PACKAGE, capture_output=True)
     if not pl.logout():
         raise PayStop("로그아웃 실패")
     log("로그아웃")
@@ -64,14 +81,25 @@ def relogin(no: str) -> None:
     pp.check_account(no)
 
 
-def find_oy_link(scrolls: int = 4) -> dict:
-    """글에서 올영 링크를 찾는다. 서로 다른 링크가 2개 이상이면 어떤 걸 살지 추측하지 않고 멈춘다."""
+def oy_link_hits() -> dict:
+    """화면의 올영 링크 {링크글자: 위치}. 경로 없는 도메인만(`oliveyoung.co.kr`)은 글 아래 링크 미리보기 카드라 뺀다
+    (크롬 실측 2026-11-27). 크롬 페이지 글자는 dump 에 안 잡히고 OCR 로만 읽힌다(실측)."""
+    hits = {}
+    for t in screen_texts():
+        m = OY_LINK.search(t["text"])
+        if m and "/" in m.group(0):
+            hits.setdefault(m.group(0).rstrip(".,)"), t)
+    return hits
+
+
+def find_oy_link(scrolls: int = 4, load_wait: float = 10) -> dict:
+    """글에서 올영 링크를 찾는다. 서로 다른 링크가 2개 이상이면 어떤 걸 살지 추측하지 않고 멈춘다.
+    처음엔 페이지가 뜰 때까지 내리지 않고 기다린다 — 로딩 중에 내리면 링크를 지나친다."""
+    end = time.time() + load_wait
     for _ in range(scrolls + 1):
-        hits = {}
-        for t in screen_texts():
-            m = OY_LINK.search(t["text"])
-            if m:
-                hits.setdefault(m.group(0).rstrip(".,)"), t)
+        hits = oy_link_hits()
+        while not hits and time.time() < end:
+            hits = oy_link_hits()
         if len(hits) == 1:
             link, hit = next(iter(hits.items()))
             log(f"올영 링크: {link}")
@@ -83,10 +111,15 @@ def find_oy_link(scrolls: int = 4) -> dict:
 
 
 def enter_oy_app(link: dict, timeout: float = 15) -> None:
-    """링크 탭 → 올영 앱 전환 대기. 쓰레드 인앱 브라우저로 열리면(미실측) 멈춘다."""
+    """링크 탭 → 올영 앱 전환 대기. 크롬 실측(2026-11-27): 첫 탭은 쓰레드 'Threads에서 대화하기' 팝업만 닫고,
+    두 번째 탭에 올영 앱이 바로 열린다 → 3초 안에 안 넘어가면 같은 자리를 한 번 더 누른다."""
     pl.tap((link["cx"], link["cy"]))
-    end = time.time() + timeout
+    end, retap_at = time.time() + timeout, time.time() + 3
     while time.time() < end:
+        if retap_at and time.time() > retap_at and OY_PACKAGE not in pp.focus():
+            pl.tap((link["cx"], link["cy"]))
+            log("링크 다시 누름 (첫 탭은 쓰레드 팝업 닫기)")
+            retap_at = 0
         if OY_PACKAGE in pp.focus():
             log("올영 앱 진입")
             return
@@ -103,7 +136,10 @@ def wait_landing(timeout: float = 15) -> str:
         if "loginId" in pl.dump_ids(pl.dump_tree(retries=1)):
             return "LOGIN"
         ocr = pl.ocr_texts(pl.adb_screencap())
-        if find_text(ocr, "구매하기", min_y=1800):
+        if any("상품을 찾을 수 없어요" in t["text"] for t in ocr):   # 실측 2026-11-27: 글의 링크 상품번호가 잘림
+            pl.shot_fail("threads", "nogoods")
+            raise PayStop("올영 '상품을 찾을 수 없어요' — 글의 링크가 잘못됐거나 판매종료")
+        if find_text(ocr, "바로구매", min_y=1800):   # 실측 2026-11-27: 하단 '장바구니' / '바로구매'
             return "PRODUCT"
         if find_text(ocr, "마이", min_y=2000):
             return "HOME"
@@ -115,8 +151,11 @@ def open_product(no: str, url: str, tries: int = 3) -> None:
     """쓰레드 → 링크 탭 → 상품 페이지. 홈이 뜨면 올영 앱을 끄고 쓰레드부터 다시 연다.
     로그인 폼이 뜨면 로그인 후 같은 방식으로 다시 연다 (사용자 지시 2026-11-18)."""
     for i in range(1, tries + 1):
-        open_threads(url)
-        enter_oy_app(find_oy_link())
+        if is_oy_url(url):
+            open_oy_direct(url)
+        else:
+            open_threads(url)
+            enter_oy_app(find_oy_link())
         screen = wait_landing()
         log(f"링크 진입 {i}/{tries}: {screen}")
         if screen == "PRODUCT":
@@ -141,25 +180,93 @@ def tap_word(word: str, timeout: float, min_y: int = 0) -> None:
     raise PayStop(f"'{word}' 버튼을 못 찾음")
 
 
-def buy_now():
-    """상품 페이지 하단 '구매하기' → 시트 '바로구매' → 주문서. 옵션 선택이 필요한 상품은 멈춘다(미실측)."""
-    tap_word("구매하기", 10, min_y=1800)
-    texts = screen_texts()
-    if any("옵션" in t["text"] and "선택" in t["text"] for t in texts):
-        raise PayStop("옵션 선택이 필요한 상품 — 옵션 시트 미실측")
-    tap_word("바로구매", 5, min_y=1500)
-    tree = pp.wait_tree(lambda t: bool(pp.text_of(t, "addrSummaryName")), 10, "주문서")
+def option_name(text: str) -> str:
+    """옵션 행 글자 = '<이름> <이름> 10% 16,200원 …' (이름이 두 번, 실측) → 이름."""
+    for i in range(len(text) // 2, 0, -1):
+        if text.startswith(text[:i] + " " + text[:i]):
+            return text[:i]
+    return text
+
+
+def option_rows(tree) -> list:
+    """옵션 목록 행(실측 2026-11-27): Button, x 84~995, 글자에 가격('원'). 화면 밖 행은 높이 0."""
+    return [n for n in pp.nodes(tree) if n.get("class", "").endswith("Button") and "원" in n.get("text", "")
+            and pl._bounds(n)[0] < 100 and pl._bounds(n)[2] > 900]
+
+
+def shown(tree, cls: str, text: str | None = None, min_y: int = 0):
+    """높이가 있는(실제로 보이는) cls 노드. 화면 밖 노드는 높이 0 으로 dump 에 남아 있다 (실측)."""
+    for n in pp.nodes(tree):
+        x1, y1, x2, y2 = pl._bounds(n)
+        if n.get("class", "").endswith(cls) and y2 - y1 > 20 and y1 >= min_y and (text is None or n.get("text") == text):
+            return n
+    return None
+
+
+def selected_ready(tree) -> bool:
+    """옵션이 골라진 상태: 수량 EditText + 하단 '바로구매' Button 이 보인다 (실측 [630,2088][1040,2232])."""
+    return shown(tree, "EditText") is not None and shown(tree, "Button", "바로구매", min_y=1800) is not None
+
+
+def scroll_option_into_view(index: int):
+    """index(1부터)번째 옵션 행이 시트 안(y 1219~2200)에 보일 때까지 시트를 민다."""
+    for _ in range(15):
+        tree = pl.dump_tree(retries=2)
+        rows = option_rows(tree)
+        if index > len(rows):
+            raise PayStop(f"옵션 {index}번 없음 (옵션 {len(rows)}개)")
+        x1, y1, x2, y2 = pl._bounds(rows[index - 1])
+        if y2 - y1 >= 100 and y1 >= 1219 and y2 <= 2200:
+            return rows[index - 1]
+        down = y2 - y1 < 100 or y2 > 2200
+        pl.shell("input", "swipe", "540", "1900" if down else "1400", "540", "1400" if down else "1900", "300")
+    raise PayStop(f"옵션 {index}번을 화면에 띄우지 못함")
+
+
+def choose_option(tree, option: int | None) -> None:
+    """옵션 1개면 그걸, 여러 개면 option 번째(1부터)를 고른다. 여러 개인데 번호가 없으면 목록을 보여주고 멈춘다."""
+    rows = option_rows(tree)
+    names = [option_name(n.get("text", "")) for n in rows]
+    if len(rows) > 1 and option is None:
+        listing = ", ".join(f"{i}.{n}" for i, n in enumerate(names, 1))
+        raise PayStop(f"옵션 {len(rows)}개 — 몇 번째인지 지정 필요: {listing}")
+    index = option or 1
+    row = scroll_option_into_view(index)
+    if "품절" in row.get("text", ""):
+        raise PayStop(f"옵션 {index}번 품절: {names[index - 1]}")
+    pl.tap(pp.center(row))
+    tree = pp.wait_tree(selected_ready, 8, "옵션 선택")
+    if shown(tree, "TextView", names[index - 1]) is None:   # 위쪽 컬러 썸네일은 Button 이라 구분된다
+        raise PayStop(f"선택된 옵션이 {index}번({names[index - 1]})이 아님")
+    log(f"옵션 {index}번 선택: {names[index - 1]}")
+
+
+def buy_now(option: int | None = None):
+    """상품 페이지 하단 '바로구매'(실측: '구매하기' 버튼은 없음) → 옵션 목록이면 고르기 → '바로구매' → 주문서."""
+    tap_word("바로구매", 10, min_y=1800)
+    tree = pp.wait_tree(lambda t: bool(option_rows(t)) or selected_ready(t) or bool(pp.text_of(t, "addrSummaryName")),
+                        10, "바로구매 이후 화면")
+    if option_rows(tree):
+        choose_option(tree, option)
+        tree = pl.dump_tree(retries=2)
+    if not pp.text_of(tree, "addrSummaryName"):
+        button = shown(tree, "Button", "바로구매", min_y=1800)
+        if button is None:
+            raise PayStop("옵션 선택 후 '바로구매' 버튼 없음")
+        pl.tap(pp.center(button))
+        log("'바로구매' 누름 (옵션 선택 후)")
+    tree = pp.wait_tree(lambda t: bool(pp.text_of(t, "addrSummaryName")), 15, "주문서")
     if pp.text_of(tree, "baseDlvpYnFlag") != "기본배송지":
         raise PayStop("기본배송지가 아님 — 변경 경로 미실측")
     log(f"배송지: {pp.text_of(tree, 'addrSummaryName')}")
     return tree
 
 
-def prepare(no: str, card: str, url: str) -> tuple:
+def prepare(no: str, card: str, url: str, option: int | None = None) -> tuple:
     """결제하기 버튼 직전까지. 주문서부터는 phone_pay.prepare 와 같은 순서."""
     relogin(no)
     open_product(no, url)
-    pp.tap_cjone(buy_now())
+    pp.tap_cjone(buy_now(option))
     tree = pp.select_card(card, pp.payment_area())
     pp.agree_all(tree)
     button = pp.find(tree, rid="btnPay")
@@ -168,12 +275,10 @@ def prepare(no: str, card: str, url: str) -> tuple:
     return amount, pp.center(button)
 
 
-def pay(no: str, card: str, url: str) -> str | None:
-    if card != "lotte":
-        raise PayStop("현대카드 앱 구간은 아직 미실측")
-    amount, button = prepare(no, card, url)
-    pl.tap(button)
-    pp.pay_lotte(amount)
+def pay(no: str, card: str, url: str, option: int | None = None) -> str | None:
+    amount, button = prepare(no, card, url, option)
+    if not pp.pay_by_card(card, button, amount):
+        return None
     order = pp.wait_order_complete(amount)
     log(f"주문 완료: {order} {amount:,}원")
     return order
@@ -189,7 +294,7 @@ def parse_accounts(spec: str) -> list[str]:
     raise ValueError(f"계정번호 형식 오류: {spec} (예: 1-10 또는 1,3,5)")
 
 
-def pay_all(spec: str, card: str, url: str) -> None:
+def pay_all(spec: str, card: str, url: str, option: int | None = None) -> None:
     """계정마다 로그아웃 → 로그인 → 쓰레드 → 구매를 순서대로. 한 계정이라도 멈추면 전체를 멈춘다(이중결제 방지)."""
     nos = parse_accounts(spec)
     for no in nos:
@@ -198,7 +303,7 @@ def pay_all(spec: str, card: str, url: str) -> None:
     for i, no in enumerate(nos, 1):
         log(f"===== {no}번 계정 ({i}/{len(nos)})")
         try:
-            order = pay(no, card, url)
+            order = pay(no, card, url, option)
         except (PayStop, RuntimeError, ValueError) as e:
             raise PayStop(f"{no}번에서 멈춤: {e} | 완료: {', '.join(done) or '없음'} | 재실행 전 {no}번 주문내역 확인")
         done.append(f"{no}번 {order}")
@@ -206,12 +311,15 @@ def pay_all(spec: str, card: str, url: str) -> None:
 
 
 def main() -> int:
-    if len(sys.argv) != 5 or sys.argv[1] not in ("prepare", "pay", "pay-all") or sys.argv[3] not in pp.CARD_NAMES:
+    args = sys.argv[1:]
+    if len(args) not in (4, 5) or args[0] not in ("prepare", "pay", "pay-all") or args[2] not in pp.CARD_NAMES \
+            or (len(args) == 5 and not args[4].isdigit()):
         print(__doc__)
         return 2
-    cmd, no, card, url = sys.argv[1:]
+    cmd, no, card, url = args[:4]
+    option = int(args[4]) if len(args) == 5 else None
     try:
-        {"prepare": prepare, "pay": pay, "pay-all": pay_all}[cmd](no, card, url)
+        {"prepare": prepare, "pay": pay, "pay-all": pay_all}[cmd](no, card, url, option)
     except (PayStop, RuntimeError, ValueError) as e:
         log(f"중단: {e}")
         return 1

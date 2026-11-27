@@ -1,13 +1,14 @@
 """올리브영 폰 결제 — 장바구니 → 주문서 → CJ ONE → 카드 선택 → 모두 동의 → 결제하기 → 카드앱 → 주문완료.
 
-2026-11-05 1번 계정 롯데카드 라이브 완주 경로를 코드로 옮긴 것(주문 Y2611059661356). 현대카드 앱 구간은 미실측.
+2026-11-05 1번 계정 롯데카드 라이브 완주 경로를 코드로 옮긴 것(주문 Y2611059661356).
+현대카드 앱 구간은 3mall pay_lotte_hyundai(2026-06-12 라이브 검증)를 옮긴 것 — 올영에선 미실측.
 고정 대기 없이 화면이 바뀌는 즉시 다음 단계로 넘어간다. 예상과 다르면 탭하지 않고 PayStop 으로 멈춘다.
 비번은 ocr_keypad.input_pin 이 card_secrets.json 에서 직접 읽어 탭한다.
 
 사용:  python3 phone_auto/phone_pay.py prepare <계정번호> <lotte|hyundai>   # 결제하기 직전까지
-       python3 phone_auto/phone_pay.py pay <계정번호> lotte                # 주문완료까지 (실제 결제)
-       python3 phone_auto/phone_pay.py relogin-pay <계정번호> lotte        # 로그아웃 → 로그인 → 주문완료
-       python3 phone_auto/phone_pay.py relogin-to-pin <계정번호> lotte     # 로그아웃 → 로그인 → PIN 화면에서 멈춤 (입력 안 함)
+       python3 phone_auto/phone_pay.py pay <계정번호> <lotte|hyundai>             # 주문완료까지 (실제 결제)
+       python3 phone_auto/phone_pay.py relogin-pay <계정번호> <lotte|hyundai>     # 로그아웃 → 로그인 → 주문완료
+       python3 phone_auto/phone_pay.py relogin-to-pin <계정번호> <lotte|hyundai>  # 로그아웃 → 로그인 → PIN 화면에서 멈춤 (입력 안 함)
 """
 from __future__ import annotations
 
@@ -21,8 +22,9 @@ import phone_login as pl
 
 CARD_NAMES = {"lotte": "롯데카드", "hyundai": "현대카드"}
 BASKET_ICON = (1006, 142)   # 마이페이지·홈 우측 상단 장바구니 (실측)
-CARD_ROWS = {"lotte": (540, 759), "hyundai": (540, 210)}   # 카드 선택창 고정 순서 (실측). 결과는 prepare 가 acqrCd 로 확인
 SAFE_TOP, SAFE_BOTTOM = 220, 2200   # 헤더·하단바에 가리지 않는 y 범위 (실측)
+HYUNDAI_PKG = "com.hyundaicard.appcard"
+HYUNDAI_CARD = "The CJ-M Edition2"   # 올영은 현대카드 앱에서 이 카드로 결제 (사용자 지정, ORDER_STEPMAP 8)
 POLL_SEC = 0.15
 START = time.time()
 
@@ -189,16 +191,32 @@ def payment_area():
     raise PayStop("결제 영역을 화면에 띄우지 못함")
 
 
+def pick_card_row(name: str) -> None:
+    """네이티브 카드 선택창에서 name 행을 **이름으로** 찾아 누른다. 2026-11-27 실측: 창이 지금 선택된 카드로
+    자동 스크롤되고 항목도 바뀌어(`카드를 선택해주세요.`·`KB카드` 추가) 고정 좌표(CARD_ROWS)가 롯데를 눌렀다.
+    못 보이면 목록 맨 위로 올렸다가 아래로 내리며 찾는다."""
+    swipes = [("600", "1800")] * 2 + [("1800", "600")] * 4
+    for i in range(len(swipes) + 1):
+        tree = wait_tree(lambda t: find(t, rid="text1") is not None, 5, "카드 선택창")
+        row = next((n for n in nodes(tree) if rid_of(n) == "text1" and n.get("text") == name
+                    and pl._bounds(n)[3] - pl._bounds(n)[1] > 100), None)
+        if row is not None:
+            pl.tap(center(row))
+            log(f"카드 선택창: {name}")
+            return
+        if i < len(swipes):
+            pl.shell("input", "swipe", "540", swipes[i][0], "540", swipes[i][1], "300")
+    raise PayStop(f"카드 선택창에서 '{name}' 을 못 찾음")
+
+
 def select_card(card: str, tree):
     """선택창이 닫히며 화면이 움직이므로, 바꿨으면 다시 읽어 지금 위치를 돌려준다."""
     name = CARD_NAMES[card]
     node = find(tree, rid="acqrCd")
     if node.get("text") != name:
         pl.tap(center(node))
-        time.sleep(0.4)
-        pl.tap(CARD_ROWS[card])
-        time.sleep(0.5)
-        tree = pl.dump_tree(retries=2)
+        pick_card_row(name)
+        tree = wait_tree(lambda t: text_of(t, "acqrCd") == name, 5, "카드 선택 반영")
     if text_of(tree, "acqrCd") != name or text_of(tree, "instMmCnt") != "일시불":
         raise PayStop("카드 또는 일시불 확인 실패")
     log(f"{name} 일시불")
@@ -284,17 +302,101 @@ def wait_order_complete(amount: int) -> str:
 
     tree = wait_tree(done, 45, "주문완료")
     order = next((n.get("text") for n in nodes(tree) if re.fullmatch(r"Y\d{10,}", n.get("text", ""))), None)
-    if not order or f"{amount:,}원" not in [n.get("text", "") for n in nodes(tree)]:
-        raise PayStop("주문완료 금액·주문번호 확인 실패 — 주문내역을 직접 확인할 것")
+    if not order:
+        raise PayStop("주문완료 주문번호 확인 실패 — 주문내역을 직접 확인할 것")
+    texts = [n.get("text", "") for n in nodes(tree)]
+    if f"{amount:,}원" not in texts:  # 현대카드 앱 즉시할인(실측 12,190 → 10,971원)이면 금액이 달라진다
+        paid = next((t for t in texts if re.fullmatch(r"[\d,]+원", t)), "?")
+        log(f"주문완료 금액이 주문서({amount:,}원)와 다름: {paid} — 카드 할인 등, 주문번호로 완료 판정")
     return order
 
 
-def pay(no: str, card: str, enter_pin: bool = True) -> str | None:
-    if card != "lotte":
-        raise PayStop("현대카드 앱 구간은 아직 미실측")
-    amount, button = prepare(no, card)
+def enter_hyundai_app(timeout: float = 30) -> None:
+    """결제하기 → (카드사 연결 화면 '앱카드 결제') → 현대카드 앱. 3mall pay_lotte_hyundai 경로, 올영 미실측.
+    '앱카드' 글자는 앱이 안 떴을 때만 5초 간격으로 다시 누른다 — 비번 전이라 이중결제 위험이 없다."""
+    end, tapped_at = time.time() + timeout, 0.0
+    while time.time() < end:
+        if HYUNDAI_PKG in focus():
+            log("현대카드 앱 진입")
+            return
+        if time.time() - tapped_at > 5:
+            hit = next((t for t in pl.ocr_texts(pl.adb_screencap()) if "앱카드" in t["text"]), None)
+            if hit:
+                pl.tap((hit["cx"], hit["cy"]))
+                tapped_at = time.time()
+                log(f"'{hit['text']}' 누름")
+        time.sleep(POLL_SEC)
+    pl.shot_fail("pay", "hyundai")
+    raise PayStop(f"현대카드 앱 미진입 (현재 화면: {focus().split('/')[-1]})")
+
+
+def hyundai_cards(tree) -> list[dict]:
+    """현대카드 앱 카드 목록. 행 = btnRoot, 이름 = tvCardName, 선택 = 행 안에 ivCheckcardRegi (3mall 실측).
+    이 화면은 FLAG_SECURE(스크린샷 검정) 라 dump 만 믿는다. 카드 순서는 매번 바뀐다 → 이름으로 찾는다."""
+    out = []
+    for row in nodes(tree):
+        if rid_of(row) != "btnRoot":
+            continue
+        ids = {rid_of(d): d for d in row.iter("node")}
+        name = ids["tvCardName"].get("text", "") if "tvCardName" in ids else ""
+        if name:
+            out.append({"name": name, "xy": center(row), "selected": "ivCheckcardRegi" in ids})
+    return out
+
+
+def select_hyundai_card(tries: int = 3):
+    """HYUNDAI_CARD 선택 + dump 재확인. 다른 카드로 결제되느니 멈춘다. 목록은 늦게 뜬다(3mall: 최대 30초)."""
+    for _ in range(tries):
+        tree = wait_tree(lambda t: bool(hyundai_cards(t)), 30, "현대카드 카드 목록")
+        cards = hyundai_cards(tree)
+        hit = next((c for c in cards if HYUNDAI_CARD in c["name"]), None)
+        if hit is None:
+            raise PayStop(f"'{HYUNDAI_CARD}' 없음 (목록: {[c['name'] for c in cards]})")
+        if hit["selected"]:
+            log(f"카드 선택 확인: {hit['name']}")
+            return tree
+        pl.tap(hit["xy"])
+        log(f"카드 탭: {hit['name']}")
+    raise PayStop(f"'{HYUNDAI_CARD}' 선택 확인 실패")
+
+
+def hyundai_keypad_ready(tree) -> bool:
+    descs = [n.get("content-desc", "") for n in nodes(tree)]
+    return sum(1 for d in descs if d.endswith(" 버튼") and d[:1].isdigit()) >= 10
+
+
+def pay_hyundai(amount: int, enter_pin: bool = True) -> bool:
+    """현대카드 앱: 카드 선택 → 금액 확인 → '결제 비밀번호 인증' → 셔플 키패드(desc='N 버튼') pin6 → 올영 복귀.
+    3mall pay_lotte_hyundai(2026-06-12 라이브 검증) 경로. 6자리 입력 후 자동 제출된다."""
+    enter_hyundai_app()
+    tree = select_hyundai_card()
+    if not any(f"{amount:,}" in n.get("text", "") for n in nodes(tree)):
+        raise PayStop(f"현대카드 앱 결제금액이 주문서({amount:,}원)와 다름")
+    auth = find(tree, text="결제 비밀번호 인증")
+    if auth is None:
+        raise PayStop("'결제 비밀번호 인증' 버튼 없음")
+    pl.tap(center(auth))
+    wait_tree(hyundai_keypad_ready, 15, "현대카드 키패드")
+    if not enter_pin:
+        log("PIN 화면 도달 — 입력하지 않고 멈춤")
+        return False
+    ocr_keypad.input_pin("hyundai")
+    wait_focus("com.oliveyoung", 30)
+    log("올영 복귀")
+    return True
+
+
+def pay_by_card(card: str, button: tuple[int, int], amount: int, enter_pin: bool = True) -> bool:
+    """결제하기 → 카드앱 결제. 남아 있던 카드앱 세션이 새 결제를 막으므로 먼저 강제 종료한다
+    (현대: 3mall 실사고 / 롯데: 2026-11-27 LOCA 가 결제요청 대신 홈으로 뜸)."""
+    pl.shell("am", "force-stop", HYUNDAI_PKG if card == "hyundai" else "com.lcacApp", capture_output=True)
     pl.tap(button)
-    if not pay_lotte(amount, enter_pin):
+    return pay_lotte(amount, enter_pin) if card == "lotte" else pay_hyundai(amount, enter_pin)
+
+
+def pay(no: str, card: str, enter_pin: bool = True) -> str | None:
+    amount, button = prepare(no, card)
+    if not pay_by_card(card, button, amount, enter_pin):
         return None
     order = wait_order_complete(amount)
     log(f"주문 완료: {order} {amount:,}원")
