@@ -92,13 +92,13 @@ class PhoneFlow:
         import threads_buy as tb
         self.pl, self.pp, self.tb = pl, pp, tb
 
-    def bind(self, guard, pay_hook, auth_hook, pin_mode: str, cf_wait: float):
+    def bind(self, guard, pay_hook, auth_hook, pin_mode: str, cancel_check):
         self.pp.ORDER_GUARD, self.pp.PAY_HOOK, self.pl.AUTH_HOOK = guard, pay_hook, auth_hook
         self.pp.PIN_MODE = pin_mode
-        self.pl.CF_USER_WAIT = cf_wait
+        self.pl.CANCEL_CHECK = cancel_check   # Cloudflare 대기 중 일시정지·중지에 바로 반응
 
     def unbind(self):
-        self.pp.ORDER_GUARD = self.pp.PAY_HOOK = self.pl.AUTH_HOOK = None
+        self.pp.ORDER_GUARD = self.pp.PAY_HOOK = self.pl.AUTH_HOOK = self.pl.CANCEL_CHECK = None
 
     def ensure_device(self, serial: str):
         if serial:
@@ -127,7 +127,8 @@ class PhoneFlow:
 
 
 class SimFlow:
-    """폰 없이 모의 실행. scenario = {계정번호: "fail_login"|"auth"|"unknown"|"disconnect"|"amount:<원>"}."""
+    """폰 없이 모의 실행. scenario = {계정번호: "fail_login"|"auth"|"auth_wait:<초>"|"unknown"|"disconnect"|"amount:<원>"}.
+    auth_wait:<초> = Cloudflare 인증이 끝내 안 되는 경우 — 실제와 같이 대기 중 일시정지·중지에 반응하고, 시간이 지나면 로그인 실패."""
     simulated = True
 
     def __init__(self, scenario: dict | None = None, step_sec: float = 0.05, amount: int = 16200):
@@ -135,8 +136,8 @@ class SimFlow:
         self.no = ""
         self.disconnected_once = set()
 
-    def bind(self, guard, pay_hook, auth_hook, pin_mode, cf_wait):
-        self.guard, self.hook, self.auth = guard, pay_hook, auth_hook
+    def bind(self, guard, pay_hook, auth_hook, pin_mode, cancel_check):
+        self.guard, self.hook, self.auth, self.cancel = guard, pay_hook, auth_hook, cancel_check
 
     def unbind(self):
         pass
@@ -152,9 +153,18 @@ class SimFlow:
         self.no = no
         sc = self._s()
         if sc == "auth":
-            self.auth("auth_required", "[모의] Cloudflare 사람 인증 필요")
+            self.auth("auth_required", "[모의] Cloudflare 인증 대기", deadline=time.time() + 60)
             time.sleep(self.step)
             self.auth("auth_done", "[모의] 인증 완료")
+        if sc.startswith("auth_wait:"):
+            wait = float(sc.split(":")[1])
+            self.auth("auth_required", "[모의] Cloudflare 인증 대기", deadline=time.time() + wait)
+            end = time.monotonic() + wait
+            while time.monotonic() < end:
+                self.cancel()
+                time.sleep(0.05)
+            self.auth("auth_timeout", "[모의] Cloudflare 인증 시간 초과")
+            raise RuntimeError("[모의] 로그인 실패: CLOUDFLARE_TIMEOUT")
         if sc == "fail_login":
             raise RuntimeError("[모의] 로그인 실패: STOP_CONSEC_FAIL:LOGIN_REJECTED")
         print(f"[모의] {no}번 로그인")
@@ -552,19 +562,23 @@ class TaskManager:
             elif event == "order_complete":
                 om.mark(payment["id"], "COMPLETE", data["order_no"], amount=data.get("amount"))
 
-        def auth_hook(kind: str, message: str):
+        def auth_hook(kind: str, message: str, deadline: float | None = None):
             if kind == "auth_required":
+                cur["auth_until"] = deadline   # 웹에서 남은 대기시간 표시
                 sm.to(S.AUTHENTICATION_REQUIRED, message)
                 log(message, "warn", "auth")
             elif kind == "auth_done":
+                cur.pop("auth_until", None)
                 sm.to(S.LOGIN_IN_PROGRESS, "인증 완료")
+            elif kind == "auth_timeout":
+                cur.pop("auth_until", None)
+                log(message, "error", "auth")
 
         router = _install_router()
         router.sinks[threading.get_ident()] = log
-        s = db.get_settings()
         # dry-run(prepare)은 PIN 단계까지 가지 않으므로 card_secrets.json 없이도 돌게 manual 로 묶는다
         pin_mode = "manual" if run["mode"] == "prepare" else run["pin_mode"]
-        flow.bind(guard, pay_hook, auth_hook, pin_mode, float(s.get("cf_user_wait", 300)))
+        flow.bind(guard, pay_hook, auth_hook, pin_mode, ctl.checkpoint)
         self._job(job_id, status="running", started_at=db.now(), error="")
         try:
             for attempt in (1, 2):
@@ -612,6 +626,7 @@ class TaskManager:
             log(f"{no}번 실패: {msg}", "error", "job")
             return "failed"
         finally:
+            cur.pop("auth_until", None)
             flow.unbind()
             router.sinks.pop(threading.get_ident(), None)
 

@@ -7,8 +7,8 @@
 2026-11-27 이후 로그인 폼의 글자 캡차(autoBlockText)는 없어지고 Cloudflare 위젯으로 바뀌었다.
 글자 캡차가 다시 보이면 자동 판독하지 않고 CAPTCHA_UNSUPPORTED 로 멈춘다(외부 OCR/LLM API 를 쓰지 않는다).
 체크박스(자동 로그인·아이디 저장)는 어떤 경우에도 누르지 않는다 — 지금 상태를 그대로 둔다.
-Cloudflare 위젯은 자동 통과('성공!')만 기다리고, 사람 확인 칸이 뜨면 AUTH_HOOK 으로 알린 뒤 사용자가 폰에서
-직접 체크할 때까지 기다렸다가 자동으로 이어간다(체크 칸을 대신 누르지 않는다).
+Cloudflare 위젯은 즉시 확인 후 3초마다 다시 보며 최대 60초 기다린다. '성공!' 이 보이면 바로 로그인 버튼을 누르고,
+60초 안에 안 되면 그 계정 로그인을 실패로 멈춘다(체크 칸을 대신 누르지 않는다).
 
 재시도 규칙:
   · 시도는 최대 3회(MAX_ATTEMPTS). 로그인 제출 실패가 2회 연속(MAX_CONSEC_FAIL)이면 그 계정은 중단.
@@ -44,18 +44,17 @@ from PIL import Image
 import adb_manager as adb
 import screen_reader as sr
 
-AUTH_HOOK = None          # callable(kind: str, message: str) — 사람 인증이 필요할 때·끝났을 때 알림 (작업 엔진이 설정)
-CF_AUTO_WAIT = 15         # Cloudflare 자동 통과 대기(초)
-CF_USER_WAIT = float(os.environ.get("CF_USER_WAIT", "300"))   # 사람 인증 대기(초)
+AUTH_HOOK = None          # callable(kind, message, **info) — 인증 대기 시작·성공·시간 초과 알림 (작업 엔진이 설정)
+CANCEL_CHECK = None       # callable() — 일시정지·중지 요청이면 예외를 던진다 (작업 엔진이 설정)
+CF_MAX_WAIT = 60          # Cloudflare 인증 최대 대기(초)
+CF_INTERVAL = 3           # 인증 상태 재확인 간격(초)
+CF_LAST = {"tree": None}  # cloudflare_passed 가 통과를 확인한 dump
 
 
-def _notify(kind: str, message: str) -> None:
+def _notify(kind: str, message: str, **info) -> None:
     print(f"[phone_login] {message}", flush=True)
     if AUTH_HOOK:
-        try:
-            AUTH_HOOK(kind, message)
-        except Exception:
-            pass
+        AUTH_HOOK(kind, message, **info)   # 상태 전환 실패 등은 숨기지 않는다
 
 
 class AdbCallError(RuntimeError):
@@ -385,8 +384,8 @@ def fill_form(acct: dict, code: str, layout: dict, tree: ET.Element | None = Non
         if tree is None:
             return "INPUT_MISMATCH"
     if not cloudflare_passed():
-        return "CLOUDFLARE"
-    tree = dump_tree(retries=1)
+        return "CLOUDFLARE_TIMEOUT"
+    tree = CF_LAST["tree"]   # 성공을 확인한 그 화면으로 바로 로그인 버튼을 찾는다(dump 1회 ≈ 3초 절약)
     if tree is None or not {"loginId", "password"}.issubset(dump_ids(tree)):
         return "LOGIN_FORM_UNVERIFIED"
     button = find_node_bounds(tree, {"text": "로그인", "cls": "Button"})
@@ -397,43 +396,77 @@ def fill_form(acct: dict, code: str, layout: dict, tree: ET.Element | None = Non
     return ""
 
 
-def cloudflare_passed(timeout: float | None = None, user_wait: float | None = None) -> bool:
-    """Cloudflare 위젯(`cloudflare-captcha`, 2026-11-27 실측) 상태 확인. 체크 칸은 절대 누르지 않는다.
+def _cf_state(tree: ET.Element | None) -> str:
+    """로그인 폼의 Cloudflare 상태 한 번 판정.
+    SUCCESS = 위젯 안에 '성공!' / WAITING = 위젯은 있는데 성공 아님 / NO_WIDGET = 정상 폼, 위젯 없음
+    / UNREADABLE = dump 실패·빈 WebView·로그인 폼 아님 (화면 인식 실패 — 성공으로 보지 않는다)."""
+    if tree is None or _empty_webview(tree):
+        return "UNREADABLE"
+    ids = dump_ids(tree)
+    if not {"loginId", "password"}.issubset(ids):
+        return "UNREADABLE"
+    if "cloudflare-captcha" not in ids:
+        return "NO_WIDGET"
+    if any(t["text"].strip() == "성공!" for t in dump_texts(tree)):
+        return "SUCCESS"
+    return "WAITING"
 
-    1) 위젯 없는 정상 로그인 폼 → True
-    2) 위젯이 '성공!' (자동 통과) → True
-    3) timeout 안에 자동 통과가 안 되면 AUTH_HOOK 으로 '사람 인증 필요'를 알리고 user_wait 동안
-       사용자가 폰에서 직접 체크하기를 기다린다 → '성공!' 이 보이면 자동으로 이어간다.
-    4) 그래도 안 되면 False (로그인 버튼 안 누름)
-    """
-    timeout = CF_AUTO_WAIT if timeout is None else timeout
-    user_wait = CF_USER_WAIT if user_wait is None else user_wait
-    deadline = time.monotonic() + timeout
-    manual_deadline = None
-    seen_widget = False
+
+def _cf_sleep(until: float) -> None:
+    """until(monotonic)까지 짧게 끊어 자면서 일시정지·중지 요청에 바로 반응한다."""
     while True:
+        if CANCEL_CHECK:
+            CANCEL_CHECK()   # 일시정지·중지면 예외로 빠져나간다
+        left = until - time.monotonic()
+        if left <= 0:
+            return
+        time.sleep(min(0.2, left))
+
+
+def cloudflare_passed(max_wait: float | None = None, interval: float | None = None) -> bool:
+    """Cloudflare 위젯(`cloudflare-captcha`) 인증 상태 확인. **체크 칸은 절대 누르지 않는다.**
+
+    · 처음 즉시 확인 → 이후 interval(3초)마다 재확인, 최대 max_wait(60초).
+    · '성공!' 이 보이면 남은 시간과 관계없이 바로 True → fill_form 이 로그인 버튼을 누른다.
+    · 위젯 없는 정상 폼은 연속 2번(3초 간격) 확인돼야 True — 위젯이 늦게 뜨는 경우를 성공으로 착각하지 않게.
+    · dump 실패·빈 화면(UNREADABLE)은 성공으로 보지 않는다.
+    · 위젯이 성공 아닌 상태면 AUTH_HOOK("auth_required", …, deadline) 으로 남은 시간을 알린다(사용자가 폰에서 직접 체크).
+    · max_wait 를 넘기면 AUTH_HOOK("auth_timeout") 후 False → 이 계정 로그인 실패(CLOUDFLARE_TIMEOUT).
+    · 기다리는 동안 CANCEL_CHECK 로 일시정지·중지에 즉시 반응한다."""
+    max_wait = CF_MAX_WAIT if max_wait is None else max_wait
+    interval = CF_INTERVAL if interval is None else interval
+    start = time.monotonic()
+    deadline = start + max_wait
+    notified = False
+    no_widget_seen = 0
+    CF_LAST["tree"] = None
+    while True:
+        tick = time.monotonic()
         tree = dump_tree(retries=1)
-        ids = dump_ids(tree)
-        valid_form = {"loginId", "password"}.issubset(ids)
-        if tree is not None and valid_form and not _empty_webview(tree):
-            if "cloudflare-captcha" in ids:
-                seen_widget = True
-                if any(t["text"].strip() == "성공!" for t in dump_texts(tree)):
-                    if manual_deadline is not None:
-                        _notify("auth_done", "Cloudflare 사람 인증 완료 확인 — 자동으로 이어갑니다")
-                    else:
-                        print("[phone_login] Cloudflare 인증 성공 확인", flush=True)
-                    return True
-            elif not seen_widget:
-                return True   # 위젯이 없는 정상 로그인 폼에서만 진행한다.
-        now = time.monotonic()
-        if manual_deadline is None and now >= deadline:
-            _notify("auth_required", f"★ Cloudflare 사람 인증 필요 — 폰에서 직접 체크해 주세요 ({user_wait:.0f}초 대기)")
-            manual_deadline = now + user_wait
-        if manual_deadline is not None and now >= manual_deadline:
-            _notify("auth_timeout", "Cloudflare 인증 완료를 확인하지 못함 — 로그인 중단")
+        state = _cf_state(tree)
+        if state in ("SUCCESS", "NO_WIDGET"):
+            CF_LAST["tree"] = tree
+        if state == "SUCCESS":
+            if notified:
+                _notify("auth_done", "Cloudflare 인증 성공 확인 — 로그인 진행")
+            else:
+                print("[phone_login] Cloudflare 인증 성공 확인", flush=True)
+            return True
+        if state == "NO_WIDGET":
+            no_widget_seen += 1
+            if no_widget_seen >= 2:
+                return True
+        else:
+            no_widget_seen = 0
+        if state == "WAITING" and not notified:
+            notified = True
+            left = max(0.0, deadline - time.monotonic())
+            _notify("auth_required", f"★ Cloudflare 인증 대기 — 폰에서 직접 체크해 주세요 (최대 {left:.0f}초)",
+                    deadline=time.time() + left)
+        if time.monotonic() >= deadline:
+            _notify("auth_timeout", f"Cloudflare 인증을 {max_wait:.0f}초 안에 확인하지 못함 — 이 계정 로그인 중단")
             return False
-        time.sleep(0.4)
+        _cf_sleep(min(tick + interval, deadline))
 
 
 def hide_keyboard() -> None:
@@ -552,6 +585,9 @@ def attempt(no: str, acct: dict, layout: dict) -> str:
     t0 = time.time()
     missing = fill_form(acct, code, layout, tree)
     print(f"[phone_login] 입력·제출 {time.time() - t0:.1f}s", flush=True)
+    if missing == "CLOUDFLARE_TIMEOUT":
+        shot_fail(no, "cloudflare")
+        return missing
     if missing:
         return f"MISSING:{missing}"
     t0 = time.time()
@@ -611,7 +647,7 @@ def login(no: str, after_logout: bool = False) -> dict:
             if not ok:
                 return {"ok": False, "status": f"ACCOUNT_MISMATCH:{why}", "attempts": i}
             return {"ok": True, "status": "LOGGED_IN", "attempts": i}
-        if r.startswith("MISSING:") or r == "CAPTCHA_UNSUPPORTED":
+        if r.startswith("MISSING:") or r in ("CAPTCHA_UNSUPPORTED", "CLOUDFLARE_TIMEOUT"):
             return {"ok": False, "status": r, "attempts": i}   # 재시도해도 같다
         consec += 1
         if consec >= MAX_CONSEC_FAIL:

@@ -40,7 +40,8 @@ sha256 확인 → 모델 로딩·추론 검증 → adb 위치 확인. `start` �
    - `실제 결제`
 3. 작업 목록에서 **실행**. 일시정지·재개·중지·실패 계정 다시 대기열로.
 4. **사람 인증 대기**: 로그아웃·로그인을 짧게 반복하면 로그인 화면에 Cloudflare `사람인지 확인하십시오` 체크 칸이 뜬다(봇 방지).
-   프로그램은 이 칸을 누르지 않고 기다린다(최대 300초, `CF_USER_WAIT`). 자동으로 `성공!` 이 되면 그냥 넘어간다.
+   프로그램은 이 칸을 누르지 않는다. 처음 즉시 확인하고 3초마다 다시 보며 **최대 60초** 기다린다(화면에 남은 시간 표시).
+   `성공!` 이 보이면 바로 로그인 버튼을 누르고, 60초가 지나면 그 계정은 로그인 실패(`CLOUDFLARE_TIMEOUT`)로 멈춘다. 대기 중 일시정지·중지는 바로 걸린다.
    Cloudflare 사람 확인이 뜨거나 결제 인증을 직접 입력으로 고른 경우 화면 위 노란 배너가 뜬다 → 폰에서 직접 처리하면 자동으로 이어간다.
 5. **결제 결과 확인 필요**(빨간 배너): 결제 인증 후 완료 화면을 못 본 건. 앱 주문내역을 보고 `결제됨(주문번호)` / `결제 안 됨` 을 입력하기 전까지
    그 계정은 다시 결제하지 않고, 그 작업은 멈춘다.
@@ -95,4 +96,4 @@ docs/OCR_BENCHMARK.md
 
 ## 환경변수
 `OY_PORT`(8000) · `ANDROID_SERIAL` · `ADB_PATH` · `OCR_DET_MODEL`(PP-OCRv6_small_det) · `OCR_PROVIDER=gpu`(CUDA/DirectML/CoreML 이 설치돼 있을 때만) ·
-`OCR_THREADS` · `PIN_MODE`(auto/manual, 명령줄용) · `CF_USER_WAIT`(초) · `SAVE_FAIL_SHOTS`
+`OCR_THREADS` · `PIN_MODE`(auto/manual, 명령줄용) · `SAVE_FAIL_SHOTS`

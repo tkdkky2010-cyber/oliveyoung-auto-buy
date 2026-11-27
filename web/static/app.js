@@ -50,10 +50,7 @@ function renderStatus(st) {
   b.classList.toggle("hidden", !unk.length);
   b.textContent = unk.length ? `결제 결과 확인이 필요한 건 ${unk.length}개 — 주문내역 확인 전에는 해당 계정을 다시 결제하지 않습니다.` : "";
   renderUnknown(unk);
-  const authJob = (st.runs || []).flatMap((r) => r.jobs).find((j) => ["AUTHENTICATION_REQUIRED", "PAYMENT_AUTH_REQUIRED"].includes(j.state) && j.status === "running");
-  const ab = $("#banner-auth");
-  ab.classList.toggle("hidden", !authJob);
-  if (authJob) ab.textContent = `${authJob.account_no}번 계정: ${authJob.state_label} — 폰에서 직접 인증해 주세요. 완료되면 자동으로 이어갑니다. ${authJob.detail || ""}`;
+  renderAuthBanner();
 
   if (selectedRun) {
     const snap = (st.runs || []).find((r) => r.run.id === selectedRun);
@@ -101,7 +98,37 @@ async function loadDetail() {
   try { renderDetail(await api(`/api/runs/${selectedRun}`)); } catch (e) { /* 지워진 작업 */ }
 }
 
+const secsLeft = (until) => Math.max(0, Math.ceil(until - Date.now() / 1000));
+
+function renderAuthBanner() {
+  // 인증 대기 중인 계정과 남은 시간. 1초마다 다시 그린다(서버 상태는 2초마다 갱신).
+  const runs = (lastStatus && lastStatus.runs) || [];
+  let text = "";
+  for (const r of runs) {
+    const c = r.run.current;
+    const job = c && r.jobs.find((j) => j.id === c.job_id);
+    if (!job || job.status !== "running") continue;
+    if (job.state === "AUTHENTICATION_REQUIRED") {
+      const left = c.auth_until ? ` — 남은 시간 ${secsLeft(c.auth_until)}초` : "";
+      text = `${job.account_no}번 계정: Cloudflare 인증 대기${left}. 폰에서 직접 체크하면 바로 로그인합니다. 시간이 지나면 이 계정은 로그인 실패로 멈춥니다.`;
+    } else if (job.state === "PAYMENT_AUTH_REQUIRED") {
+      text = `${job.account_no}번 계정: 결제 인증 대기 — 폰에서 직접 인증해 주세요. 완료되면 자동으로 이어갑니다.`;
+    }
+  }
+  const ab = $("#banner-auth");
+  ab.classList.toggle("hidden", !text);
+  ab.textContent = text;
+}
+
+let lastSnap = null;
+setInterval(() => {
+  renderAuthBanner();
+  const c = lastSnap && lastSnap.run.current;
+  if (c && (c.auth_until || c.rest_until)) renderDetail(lastSnap);
+}, 1000);
+
 function renderDetail(snap) {
+  lastSnap = snap;
   const r = snap.run;
   $("#detail-title").textContent = `#${r.id} · ${MODE_KO[r.mode]} · ${STATUS_KO[r.status] || r.status}`;
   $("#progress-bar").style.width = r.progress + "%";
@@ -110,7 +137,10 @@ function renderDetail(snap) {
   const resting = r.current && r.current.state === "REST";
   const cur = r.current && !resting ? `${r.current.account_no}번` : "-";
   const curJob = r.current && !resting ? jobs.find((j) => j.id === r.current.job_id) : null;
-  const step = resting ? `다음 계정까지 ${Math.max(0, Math.ceil(r.current.rest_until - Date.now() / 1000))}초 대기` : (curJob ? curJob.state_label : "-");
+  const authing = curJob && curJob.state === "AUTHENTICATION_REQUIRED" && r.current.auth_until;
+  const step = resting ? `다음 계정까지 ${secsLeft(r.current.rest_until)}초 대기`
+    : authing ? `Cloudflare 인증 대기 (남은 ${secsLeft(r.current.auth_until)}초)`
+    : (curJob ? curJob.state_label : "-");
   $("#detail-stats").innerHTML = [
     ["진행률", r.progress + "%"], ["현재 계정", cur], ["현재 단계", step],
     ["성공", count("completed")], ["점검 완료", count("prepared")], ["실패", count("failed")], ["결과 불명", count("unknown")],

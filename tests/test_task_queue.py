@@ -248,3 +248,31 @@ def test_wrong_address_stops_before_payment(tmpdb):
     j = m.snapshot(rid)["jobs"][0]
     assert j["status"] == "failed" and "배송지 확인 실패" in j["error"]
     assert tmpdb.one("SELECT COUNT(*) n FROM payments")["n"] == 0   # 결제하기 안 누름
+
+
+def test_cloudflare_wait_pause_and_stop(tmpdb):
+    m = mgr({"1": "auth_wait:30"})
+    rid = reg(m, accounts="1")
+    m.start(rid)
+    end = time.time() + 5
+    while time.time() < end and (m.current.get(rid) or {}).get("state") != "AUTHENTICATION_REQUIRED":
+        time.sleep(0.02)
+    cur = m.snapshot(rid)["run"]["current"]
+    assert 25 < cur["auth_until"] - time.time() <= 30          # 웹에 남은 시간 표시용
+    t0 = time.time()
+    m.pause(rid)
+    assert wait_status(m, rid, {"paused"}, timeout=2) == "paused" and time.time() - t0 < 1
+    assert m.snapshot(rid)["jobs"][0]["state"] == "PAUSED"
+    m.stop(rid)
+    assert wait_status(m, rid, {"stopped"}, timeout=2) == "stopped"
+
+
+def test_cloudflare_timeout_fails_account_and_continues(tmpdb):
+    m = mgr({"1": "auth_wait:0.3"})
+    rid = reg(m, accounts="1-2", stop_on_failure=False)
+    m.start(rid)
+    wait_status(m, rid, {"completed_with_failures"})
+    jobs = m.snapshot(rid)["jobs"]
+    assert jobs[0]["status"] == "failed" and "CLOUDFLARE_TIMEOUT" in jobs[0]["error"]
+    assert jobs[1]["status"] == "completed"
+    assert tmpdb.one("SELECT COUNT(*) n FROM payments WHERE account_no='1'")["n"] == 0

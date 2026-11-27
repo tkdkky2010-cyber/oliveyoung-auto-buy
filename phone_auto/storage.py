@@ -51,7 +51,6 @@ CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id, id);
 """
 
 DEFAULT_SETTINGS = {
-    "cf_user_wait": 300,             # Cloudflare 사람 인증 대기(초)
 }
 
 _local = threading.local()

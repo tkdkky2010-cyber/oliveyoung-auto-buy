@@ -37,7 +37,7 @@ def patch(monkeypatch, trees):
     monkeypatch.setattr(pl, "shell", lambda *a, **k: shells.append(a) or "")
     monkeypatch.setattr(pl, "hide_keyboard", lambda: None)
     monkeypatch.setattr(pl.time, "sleep", lambda s: None)
-    monkeypatch.setattr(pl, "AUTH_HOOK", lambda kind, msg: notes.append(kind))
+    monkeypatch.setattr(pl, "AUTH_HOOK", lambda kind, msg, **kw: notes.append(kind))
     return taps, shells, notes
 
 
@@ -57,28 +57,110 @@ def test_fill_form_never_taps_checkboxes(monkeypatch):
     assert not checkbox_hit(shell_taps)
 
 
-def test_cloudflare_success_without_tap(monkeypatch):
-    taps, _, notes = patch(monkeypatch, [tree("확인 중")] * 3 + [tree("성공!")])
-    clock = iter(range(0, 1000, 10))
-    monkeypatch.setattr(pl.time, "monotonic", lambda: next(clock))
-    assert pl.cloudflare_passed(timeout=15, user_wait=300) is True
+class Clock:
+    """가짜 시계 — sleep 하면 시간이 그만큼 흐른다."""
+    def __init__(self, monkeypatch):
+        self.t = 1000.0
+        self.dumps = []
+        monkeypatch.setattr(pl.time, "monotonic", lambda: self.t)
+        monkeypatch.setattr(pl.time, "sleep", self.sleep)
+
+    def sleep(self, s):
+        self.t += s
+
+
+def cf_patch(monkeypatch, states):
+    """states: 매 dump 마다 돌려줄 트리(마지막 것을 계속 반복). dump 1회는 0.5초 걸린다고 친다."""
+    taps, _, notes = patch(monkeypatch, [tree()])
+    clock = Clock(monkeypatch)
+    seq = list(states)
+
+    def dump(retries=3):
+        clock.dumps.append(round(clock.t - 1000.0, 2))
+        clock.t += 0.5
+        return seq.pop(0) if len(seq) > 1 else seq[0]
+
+    monkeypatch.setattr(pl, "dump_tree", dump)
+    return taps, notes, clock
+
+
+def test_cf_constants_60s_3s():
+    assert pl.CF_MAX_WAIT == 60 and pl.CF_INTERVAL == 3
+    assert not hasattr(pl, "CF_USER_WAIT") and not hasattr(pl, "CF_AUTO_WAIT")
+
+
+def test_cf_success_immediately(monkeypatch):
+    taps, notes, clock = cf_patch(monkeypatch, [tree("성공!")])
+    assert pl.cloudflare_passed() is True
+    assert clock.dumps == [0.0] and taps == [] and notes == []   # 처음 즉시 확인, 기다림 없음
+
+
+def test_cf_polls_every_3s_and_proceeds_on_success(monkeypatch):
+    taps, notes, clock = cf_patch(monkeypatch, [tree("확인 중")] * 4 + [tree("성공!")])
+    assert pl.cloudflare_passed() is True
+    assert clock.dumps == [0.0, 3.0, 6.0, 9.0, 12.0]   # 3초 간격, 성공 보자마자 끝
     assert taps == [] and notes == ["auth_required", "auth_done"]
 
 
-def test_cloudflare_timeout_stops(monkeypatch):
-    taps, _, notes = patch(monkeypatch, [tree("사람인지 확인하십시오")] * 100)
-    clock = iter(range(0, 10000, 10))
-    monkeypatch.setattr(pl.time, "monotonic", lambda: next(clock))
-    assert pl.cloudflare_passed(timeout=15, user_wait=60) is False
+def test_cf_timeout_60s(monkeypatch):
+    taps, notes, clock = cf_patch(monkeypatch, [tree("사람인지 확인하십시오")])
+    assert pl.cloudflare_passed() is False
+    assert clock.dumps[0] == 0.0 and clock.dumps[-1] == 60.0 and len(clock.dumps) == 21
+    assert all(b - a == 3.0 for a, b in zip(clock.dumps, clock.dumps[1:]))
     assert taps == [] and notes == ["auth_required", "auth_timeout"]
 
 
-def test_fill_form_cloudflare_blocks_login_tap(monkeypatch):
-    taps, _, _ = patch(monkeypatch, [tree("사람인지 확인하십시오")] * 200)
-    clock = iter(range(0, 100000, 50))
-    monkeypatch.setattr(pl.time, "monotonic", lambda: next(clock))
-    assert pl.fill_form(ACCT, "", pl.load_layout(), tree(filled=False)) == "CLOUDFLARE"
+def test_cf_unreadable_is_not_success(monkeypatch):
+    empty = ET.fromstring('<hierarchy><node class="android.webkit.WebView" bounds="[0,0][1080,2400]"/></hierarchy>')
+    taps, notes, clock = cf_patch(monkeypatch, [None, empty, ET.fromstring("<hierarchy/>")])
+    assert pl.cloudflare_passed() is False and clock.dumps[-1] == 60.0
+    assert notes == ["auth_timeout"]
+
+
+def test_cf_no_widget_needs_two_reads(monkeypatch):
+    taps, notes, clock = cf_patch(monkeypatch, [tree()])
+    assert pl.cloudflare_passed() is True and clock.dumps == [0.0, 3.0]
+    # 첫 판독엔 위젯이 없다가 늦게 뜨면 성공으로 보지 않는다
+    taps, notes, clock = cf_patch(monkeypatch, [tree(), tree("확인 중")])
+    assert pl.cloudflare_passed() is False and notes == ["auth_required", "auth_timeout"]
+
+
+def test_cf_pause_stop_react_immediately(monkeypatch):
+    import pytest
+    from state_machine import Paused
+    taps, notes, clock = cf_patch(monkeypatch, [tree("확인 중")])
+
+    def cancel():
+        if clock.t - 1000.0 >= 4.0:
+            raise Paused()
+
+    monkeypatch.setattr(pl, "CANCEL_CHECK", cancel)
+    with pytest.raises(Paused):
+        pl.cloudflare_passed()
+    assert clock.t - 1000.0 < 4.5   # 다음 3초 주기를 기다리지 않고 0.2초 안에 반응
+
+
+def test_fill_form_success_taps_only_login(monkeypatch):
+    taps, notes, clock = cf_patch(monkeypatch, [tree("확인 중"), tree("성공!")])
+    monkeypatch.setattr(pl, "inputs_ok", lambda a, c, l: tree("확인 중"))
+    assert pl.fill_form(ACCT, "", pl.load_layout(), tree(filled=False)) == ""
+    assert taps == [((39 + 1040) // 2, (1531 + 1678) // 2)] and not checkbox_hit(taps)
+
+
+def test_fill_form_cloudflare_timeout_no_login_tap(monkeypatch):
+    taps, notes, clock = cf_patch(monkeypatch, [tree("사람인지 확인하십시오")])
+    monkeypatch.setattr(pl, "inputs_ok", lambda a, c, l: tree("사람인지 확인하십시오"))
+    assert pl.fill_form(ACCT, "", pl.load_layout(), tree(filled=False)) == "CLOUDFLARE_TIMEOUT"
     assert taps == []
+
+
+def test_login_cloudflare_timeout_no_retry(monkeypatch):
+    calls = []
+    monkeypatch.setattr(pl, "load_account", lambda no: ACCT)
+    monkeypatch.setattr(pl, "open_login_form", lambda: "LOGIN_FORM")
+    monkeypatch.setattr(pl, "attempt", lambda no, a, l: calls.append(1) or "CLOUDFLARE_TIMEOUT")
+    r = pl.login("1")
+    assert r == {"ok": False, "status": "CLOUDFLARE_TIMEOUT", "attempts": 1} and len(calls) == 1
 
 
 def test_account_matches(monkeypatch):
