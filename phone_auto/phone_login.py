@@ -134,7 +134,9 @@ RESULT_TIMEOUT = 12   # 로그인 버튼 후 결과 화면 대기(초)
 DEFAULT_LAYOUT = {
     "id_field":        {"rid": "loginId"},                                    # [39,494][1040,640]
     "pw_field":        {"rid": "password"},                                   # [39,631][1040,775]
-    "captcha_field":   {"rid": "autoBlockText"},                              # [39,1222][1040,1346]
+    # 비밀번호 아래 체크박스 (자동 로그인). text 로 찾고, rid 가 있으면 oy_login_layout.json 으로 덮어쓴다.
+    "auto_login_check": {"text": "자동 로그인"},
+    "captcha_field":   {"rid": "autoBlockText"},                              # [39,1222][1040,1346] — 2026-11-27 이후 없음
     "captcha_image":   {"desc": "자동 입력방지 문자 입력 이미지", "cls": "Image"},  # [42,1003][759,1197]
     "captcha_refresh": {"rid": "reLoad"},                                     # [756,1000][1040,1101]
     "login_button":    {"text": "로그인", "cls": "Button"},                    # [39,1531][1040,1678] (rid 없음)
@@ -149,7 +151,8 @@ SCREEN_MARKERS = [
     # 로그인 오류는 네이티브 AlertDialog(message + button1, 실측). 문구가 위 둘에 안 걸리면 여기로.
     #   실측 문구: '자동입력 방지 문자를 입력해주세요.' (캡차 칸 비었을 때)
     ("ALERT",          lambda t, ids: "message" in ids and "button1" in ids),
-    ("LOGIN_FORM",     lambda t, ids: "autoBlockText" in ids and "loginId" in ids),  # 실측
+    # 2026-11-27: 글자 캡차(autoBlockText) 제거됨 → loginId+password 로 판정 (Cloudflare 위젯 여부와 무관)
+    ("LOGIN_FORM",     lambda t, ids: "loginId" in ids and "password" in ids),
     # 홈(하단 탭바 보임). ★로그인 여부는 여기서 판정하지 않는다 — 로그아웃 상태 홈도 똑같다(2026-11-04 실측 오판).
     #   로그인 여부는 is_logged_in() = 마이 탭 → 로그인 폼이 뜨면 로그아웃 상태(실측).
     ("HOME",           lambda t, ids: "loginId" not in ids and "tabBar" in ids),
@@ -436,8 +439,55 @@ def inputs_ok(acct: dict, code: str, layout: dict) -> ET.Element | None:
     return tree
 
 
+def ensure_auto_login_checked(layout: dict, tree: ET.Element | None = None) -> None:
+    """비밀번호 아래 '자동 로그인' 체크박스를 켠다.
+    dump 의 checked 속성은 주문서 동의 칸처럼 안 바뀔 수 있으므로(실측 패턴),
+    이미 checked=true 이면 스킵하고, 아니면 라벨/체크박스 자리를 탭한다.
+    글자(OCR)로도 찾고, 비밀번호 필드 바로 아래 CheckBox 도 후보로 본다."""
+    if tree is None:
+        tree = dump_tree(retries=1)
+    texts = dump_texts(tree) if tree is not None else []
+    xy = locate("auto_login_check", layout, tree, texts)
+    node = None
+    if tree is not None:
+        node = next((n for n in tree.iter("node") if _node_matches(n, layout["auto_login_check"])), None)
+        if node is None:
+            pw = next((n for n in tree.iter("node") if _node_matches(n, layout["pw_field"])), None)
+            if pw is not None:
+                _, pw_y1, _, pw_y2 = _bounds(pw)
+                cands = []
+                for n in tree.iter("node"):
+                    if "CheckBox" not in n.attrib.get("class", ""):
+                        continue
+                    if not _visible(n):
+                        continue
+                    x1, y1, x2, y2 = _bounds(n)
+                    if y1 >= pw_y2 - 20:
+                        cands.append((y1 - pw_y2, n, (x1 + x2) // 2, (y1 + y2) // 2))
+                if cands:
+                    cands.sort(key=lambda t: t[0])
+                    _, node, cx, cy = cands[0]
+                    xy = (cx, cy)
+    if node is not None and node.attrib.get("checked") == "true":
+        print("[phone_login] 자동 로그인 이미 체크됨", flush=True)
+        return
+    if xy is None:
+        ocr = ocr_texts(adb_screencap())
+        for label in ("자동로그인", "로그인상태유지"):
+            hit = next((t for t in ocr if label in t["text"].replace(" ", "")), None)
+            if hit:
+                xy = (hit["cx"], hit["cy"])
+                break
+    if xy is None:
+        print("[phone_login] 자동 로그인 체크박스를 못 찾음 — layout auto_login_check 실측 필요", flush=True)
+        return
+    tap(xy)
+    time.sleep(0.25)
+    print("[phone_login] 자동 로그인 체크 탭", flush=True)
+
+
 def fill_form(acct: dict, code: str, layout: dict, tree: ET.Element | None = None) -> str:
-    """ID/PW/캡차 입력 → 값 검증 → 로그인 탭. 실패 사유(성공 시 빈 문자열) 반환."""
+    """ID/PW/캡차 입력 → 자동 로그인 체크 → 값 검증 → 로그인 탭. 실패 사유(성공 시 빈 문자열) 반환."""
     tree = fill_fast(acct, code, layout, tree)
     if tree is None:
         for name, value in (("id_field", acct["id"]), ("pw_field", acct["pw"]), ("captcha_field", code)):
@@ -448,8 +498,10 @@ def fill_form(acct: dict, code: str, layout: dict, tree: ET.Element | None = Non
         tree = inputs_ok(acct, code, layout)
         if tree is None:
             return "INPUT_MISMATCH"
+    ensure_auto_login_checked(layout, tree)
     if not cloudflare_passed():
         return "CLOUDFLARE"
+    tree = dump_tree(retries=1) or tree
     xy = locate("login_button", layout, tree, dump_texts(tree))
     if xy is None:
         return "login_button"
@@ -457,11 +509,50 @@ def fill_form(acct: dict, code: str, layout: dict, tree: ET.Element | None = Non
     return ""
 
 
+def _find_cloudflare_tap(tree: ET.Element | None) -> tuple[int, int] | None:
+    """Cloudflare '사람인지 확인' 체크 칸 좌표. dump → OCR 순."""
+    if tree is not None:
+        for n in tree.iter("node"):
+            if not _visible(n):
+                continue
+            rid = n.attrib.get("resource-id", "")
+            text = n.attrib.get("text", "")
+            desc = n.attrib.get("content-desc", "")
+            cls = n.attrib.get("class", "")
+            blob = f"{rid} {text} {desc}".lower()
+            if "cloudflare" in blob or "사람인지" in text or "확인하십시오" in text:
+                x1, y1, x2, y2 = _bounds(n)
+                return (x1 + x2) // 2, (y1 + y2) // 2
+            if "CheckBox" in cls and ("성공" not in text):
+                x1, y1, x2, y2 = _bounds(n)
+                if y1 > 400:
+                    return (x1 + x2) // 2, (y1 + y2) // 2
+        for it in dump_texts(tree):
+            t = it["text"].replace(" ", "")
+            if "사람인지확인" in t or "확인하십시오" in t or "정보보호" in t:
+                return it["cx"], it["cy"]
+    ocr = ocr_texts(adb_screencap())
+    for label in ("사람인지 확인", "사람인지확인", "확인하십시오", "I'm not a robot"):
+        hit = next((t for t in ocr if label.replace(" ", "") in t["text"].replace(" ", "")), None)
+        if hit:
+            return hit["cx"], hit["cy"]
+    return None
+
+
 def cloudflare_passed(timeout: float = 15, user_wait: float = 10) -> bool:
-    """로그인 폼의 Cloudflare 인증 위젯(`cloudflare-captcha`, 2026-11-27 실측)이 스스로 '성공!' 을 띄울 때까지 기다린다.
-    위젯이 없으면 바로 True. timeout 안에 성공이 안 뜨면 '사람인지 확인' 체크 칸이
-    뜬 것 — 사용자가 폰에서 직접 체크하도록 user_wait 초 더 기다린다(사용자 지시 2026-11-27). 그래도 안 되면 False."""
-    end, asked = time.time() + timeout, False
+    """로그인 폼의 Cloudflare 인증 위젯(`cloudflare-captcha`, 2026-11-27 실측).
+
+    1) 위젯 없으면 바로 True
+    2) 이미 '성공!' 이면 True
+    3) timeout 전에 자동 성공을 잠깐 기다림
+    4) 안 되면 dump/OCR 로 체크 칸을 한 번 탭 시도 → 몇 초 더 성공 대기
+    5) 그래도 안 되면 사용자 직접 체크 대기(user_wait)
+    6) 최종 실패 시 False
+    """
+    tapped = False
+    end = time.time() + timeout
+    user_deadline = None
+
     while True:
         tree = dump_tree(retries=1)
         if "cloudflare-captcha" not in dump_ids(tree):
@@ -469,12 +560,35 @@ def cloudflare_passed(timeout: float = 15, user_wait: float = 10) -> bool:
         if any(t["text"].strip() == "성공!" for t in dump_texts(tree)):
             print("[phone_login] Cloudflare 인증 '성공!' 확인", flush=True)
             return True
-        if time.time() > end and not asked:
+
+        now = time.time()
+
+        if now < end and not tapped:
+            time.sleep(0.4)
+            continue
+
+        if not tapped:
+            xy = _find_cloudflare_tap(tree)
+            if xy is not None:
+                print(f"[phone_login] Cloudflare 체크 칸 탭 시도 {xy}", flush=True)
+                tap(xy)
+                tapped = True
+                end = time.time() + 8
+                time.sleep(0.8)
+                continue
+            print(f"[phone_login] ★ Cloudflare 체크 칸 위치 못 찾음 — 폰에서 직접 체크해 주세요 ({user_wait:.0f}초 대기)", flush=True)
+            user_deadline = time.time() + user_wait
+            tapped = True
+            continue
+
+        if user_deadline is None:
             print(f"[phone_login] ★ Cloudflare 체크 칸 — 폰에서 직접 체크해 주세요 ({user_wait:.0f}초 대기)", flush=True)
-            end, asked = time.time() + user_wait, True
-        elif time.time() > end:
+            user_deadline = time.time() + user_wait
+
+        if now >= user_deadline:
             print("[phone_login] Cloudflare 인증이 '성공!' 이 아님 — 직접 확인 필요, 로그인 안 누름", flush=True)
             return False
+        time.sleep(0.4)
 
 
 def hide_keyboard() -> None:
