@@ -73,6 +73,12 @@ def _install_router() -> _Router:
     return _router
 
 
+def _ocr_counts() -> tuple[int, int]:
+    import ocr_engine
+    s = ocr_engine.status()
+    return s.get("calls", 0), s.get("cache_hits", 0)
+
+
 def redact(text: str, secrets: list[str]) -> str:
     for s in secrets:
         if s and len(s) >= 3:
@@ -580,6 +586,11 @@ class TaskManager:
         pin_mode = "manual" if run["mode"] == "prepare" else run["pin_mode"]
         flow.bind(guard, pay_hook, auth_hook, pin_mode, ctl.checkpoint)
         self._job(job_id, status="running", started_at=db.now(), error="")
+        t_job = time.monotonic()
+        ocr0 = _ocr_counts()
+        if not sim:
+            import screen_reader as sr
+            sr.reset_stats()
         try:
             for attempt in (1, 2):
                 try:
@@ -628,6 +639,13 @@ class TaskManager:
         finally:
             cur.pop("auth_until", None)
             flow.unbind()
+            if not sim:
+                import screen_reader as sr
+                st, ocr1 = sr.stats(), _ocr_counts()
+                log(f"{no}번 화면 읽기: dump {st['dumps']}회({st['dump_sec']}초) · dump 재사용 {st['dump_reuse']}회 · "
+                    f"스크린샷 {st['shots']}회 · OCR {ocr1[0] - ocr0[0]}회(캐시 {ocr1[1] - ocr0[1]}회) · "
+                    f"계정 처리 {time.monotonic() - t_job:.1f}초 · dump 캐시 {'켜짐' if sr.DUMP_CACHE else '꺼짐'}",
+                    "info", "perf")
             router.sinks.pop(threading.get_ident(), None)
 
     def _steps(self, run: dict, job: dict, flow, sm: StateMachine, ctl: Control) -> str:

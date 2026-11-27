@@ -28,9 +28,14 @@ OY_LINK = re.compile(r"(oliveyoung\.co\.kr|oy\.run)\S*", re.I)   # 큐레이터 
 OY_PACKAGE = "com.oliveyoung"
 
 
-def screen_texts() -> list[dict]:
-    """OCR(실제 화면) + dump(WebView 글자). 둘 다 같은 형식 {text,cx,cy}."""
-    return pl.ocr_texts(pl.adb_screencap()) + pl.dump_texts(pl.dump_tree(retries=1))
+def ocr_then_dump(pick):
+    """OCR 로 먼저 찾고(pick(texts) → 결과), 못 찾았을 때만 dump 글자까지 본다.
+    예전엔 매번 OCR + dump(≈3초) 를 함께 읽었다. OCR 이 먼저였으므로 OCR 에서 찾으면 결과는 같다."""
+    ocr = pl.ocr_texts(pl.adb_screencap())
+    hit = pick(ocr)
+    if hit:
+        return hit
+    return pick(ocr + pl.dump_texts(pl.dump_tree(retries=1)))
 
 
 def find_text(texts: list[dict], word: str, min_y: int = 0) -> dict | None:
@@ -87,12 +92,14 @@ def relogin(no: str) -> None:
 def oy_link_hits() -> dict:
     """화면의 올영 링크 {링크글자: 위치}. 경로 없는 도메인만(`oliveyoung.co.kr`)은 글 아래 링크 미리보기 카드라 뺀다
     (크롬 실측 2026-11-27). 크롬 페이지 글자는 dump 에 안 잡히고 OCR 로만 읽힌다(실측)."""
-    hits = {}
-    for t in screen_texts():
-        m = OY_LINK.search(t["text"])
-        if m and "/" in m.group(0):
-            hits.setdefault(m.group(0).rstrip(".,)"), t)
-    return hits
+    def pick(texts):
+        hits = {}
+        for t in texts:
+            m = OY_LINK.search(t["text"])
+            if m and "/" in m.group(0):
+                hits.setdefault(m.group(0).rstrip(".,)"), t)
+        return hits
+    return ocr_then_dump(pick)
 
 
 def find_oy_link(scrolls: int = 4, load_wait: float = 10) -> dict:
@@ -136,8 +143,7 @@ def wait_landing(timeout: float = 15) -> str:
     dump 는 뒤쪽 숨은 WebView 글자도 잡으므로 버튼은 실제 화면인 OCR 로만 본다."""
     end = time.time() + timeout
     while time.time() < end:
-        if "loginId" in pl.dump_ids(pl.dump_tree(retries=1)):
-            return "LOGIN"
+        # OCR 로 먼저 본다 — 상품·홈·없는 상품은 화면 글자로 확실하다. 로그인 폼(loginId)만 dump 로 본다.
         ocr = pl.ocr_texts(pl.adb_screencap())
         if any("상품을 찾을 수 없어요" in t["text"] for t in ocr):   # 실측 2026-11-27: 글의 링크 상품번호가 잘림
             pl.shot_fail("threads", "nogoods")
@@ -146,6 +152,8 @@ def wait_landing(timeout: float = 15) -> str:
             return "PRODUCT"
         if find_text(ocr, "마이", min_y=2000):
             return "HOME"
+        if "loginId" in pl.dump_ids(pl.dump_tree(retries=1)):
+            return "LOGIN"
     pl.shot_fail("threads", "landing")
     raise PayStop("링크 진입 후 화면 판정 불가")
 
@@ -174,7 +182,7 @@ def tap_word(word: str, timeout: float, min_y: int = 0) -> None:
     """글자가 보일 때까지 읽고 탭한다. 화면 아래쪽 버튼만 보려면 min_y."""
     end = time.time() + timeout
     while time.time() < end:
-        hit = find_text(screen_texts(), word, min_y)
+        hit = ocr_then_dump(lambda texts: find_text(texts, word, min_y))
         if hit:
             pl.tap((hit["cx"], hit["cy"]))
             log(f"'{word}' 누름")
@@ -211,10 +219,10 @@ def selected_ready(tree) -> bool:
     return shown(tree, "EditText") is not None and shown(tree, "Button", "바로구매", min_y=1800) is not None
 
 
-def scroll_option_into_view(index: int):
-    """index(1부터)번째 옵션 행이 시트 안(y 1219~2200)에 보일 때까지 시트를 민다."""
+def scroll_option_into_view(index: int, tree=None):
+    """index(1부터)번째 옵션 행이 시트 안(y 1219~2200)에 보일 때까지 시트를 민다. tree 를 주면 첫 판정에 그대로 쓴다."""
     for _ in range(15):
-        tree = pl.dump_tree(retries=2)
+        tree = tree if tree is not None else pl.dump_tree(retries=2)
         rows = option_rows(tree)
         if index > len(rows):
             raise PayStop(f"옵션 {index}번 없음 (옵션 {len(rows)}개)")
@@ -223,10 +231,11 @@ def scroll_option_into_view(index: int):
             return rows[index - 1]
         down = y2 - y1 < adb.sy(100) or y2 > adb.sy(2200)
         pp.swipe((540, 1900 if down else 1400), (540, 1400 if down else 1900), 300)
+        tree = None   # 밀었으니 다시 읽는다
     raise PayStop(f"옵션 {index}번을 화면에 띄우지 못함")
 
 
-def choose_option(tree, option: int | None) -> None:
+def choose_option(tree, option: int | None):
     """옵션 1개면 그걸, 여러 개면 option 번째(1부터)를 고른다. 여러 개인데 번호가 없으면 목록을 보여주고 멈춘다."""
     rows = option_rows(tree)
     names = [option_name(n.get("text", "")) for n in rows]
@@ -234,7 +243,7 @@ def choose_option(tree, option: int | None) -> None:
         listing = ", ".join(f"{i}.{n}" for i, n in enumerate(names, 1))
         raise PayStop(f"옵션 {len(rows)}개 — 몇 번째인지 지정 필요: {listing}")
     index = option or 1
-    row = scroll_option_into_view(index)
+    row = scroll_option_into_view(index, tree)   # 방금 읽은 옵션 목록을 그대로 쓴다(dump 1회 절약)
     if "품절" in row.get("text", ""):
         raise PayStop(f"옵션 {index}번 품절: {names[index - 1]}")
     pl.tap(pp.center(row))
@@ -242,6 +251,7 @@ def choose_option(tree, option: int | None) -> None:
     if shown(tree, "TextView", names[index - 1]) is None:   # 위쪽 컬러 썸네일은 Button 이라 구분된다
         raise PayStop(f"선택된 옵션이 {index}번({names[index - 1]})이 아님")
     log(f"옵션 {index}번 선택: {names[index - 1]}")
+    return tree   # 선택 확인에 쓴 화면 — 수량·바로구매 판정에 그대로 쓴다
 
 
 def quantity_value(tree) -> int | None:
@@ -283,8 +293,7 @@ def buy_now(option: int | None = None, quantity: int = 1):
     tree = pp.wait_tree(lambda t: bool(option_rows(t)) or selected_ready(t) or bool(pp.text_of(t, "addrSummaryName")),
                         10, "바로구매 이후 화면")
     if option_rows(tree):
-        choose_option(tree, option)
-        tree = pl.dump_tree(retries=2)
+        tree = choose_option(tree, option)   # (예전: 여기서 dump 를 한 번 더 했다)
     if not pp.text_of(tree, "addrSummaryName"):
         tree = set_quantity(tree, quantity)
     elif quantity != 1:

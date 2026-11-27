@@ -96,4 +96,4 @@ docs/OCR_BENCHMARK.md
 
 ## 환경변수
 `OY_PORT`(8000) · `ANDROID_SERIAL` · `ADB_PATH` · `OCR_DET_MODEL`(PP-OCRv6_small_det) · `OCR_PROVIDER=gpu`(CUDA/DirectML/CoreML 이 설치돼 있을 때만) ·
-`OCR_THREADS` · `PIN_MODE`(auto/manual, 명령줄용) · `SAVE_FAIL_SHOTS`
+`OCR_THREADS` · `PIN_MODE`(auto/manual, 명령줄용) · `SAVE_FAIL_SHOTS` · `DUMP_CACHE`(1/0, 화면 그대로일 때 UIAutomator dump 재사용 — 전후 비교용)

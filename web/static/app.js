@@ -41,6 +41,7 @@ function renderStatus(st) {
     ["검출 모델", o.det_model], ["인식 모델", o.rec_model], ["장치", (o.providers || ["-"])[0]?.replace("ExecutionProvider", "")],
     ["최근 처리시간", o.last_ms ? o.last_ms + " ms" : "-"], ["최근 평균 신뢰도", o.last_conf ? (o.last_conf * 100).toFixed(1) + "%" : "-"],
     ["OCR 호출 / 캐시", `${o.calls ?? 0} / ${o.cache_hits ?? 0}`],
+    ["dump 호출 / 재사용", `${st.screen?.dumps ?? 0} / ${st.screen?.dump_reuse ?? 0}`],
   ].map(([k, v]) => `<div class="stat"><b>${esc(v)}</b><span>${k}</span></div>`).join("") + (o.load_error ? `<div class="muted">${esc(o.load_error)}</div>` : "");
   const t = st.today.real;
   $("#today-stats").innerHTML = `<div class="stat"><b>${t.orders}건</b><span>오늘 결제(실제)</span></div><div class="stat"><b>${won(t.amount) || "0원"}</b><span>오늘 결제금액</span></div>`;

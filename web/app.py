@@ -26,6 +26,7 @@ from pydantic import BaseModel, Field  # noqa: E402
 import adb_manager as adb  # noqa: E402
 import ocr_engine  # noqa: E402
 import order_manager as om  # noqa: E402
+import screen_reader  # noqa: E402
 import storage as db  # noqa: E402
 import task_queue  # noqa: E402
 
@@ -141,6 +142,7 @@ def status_payload() -> dict:
     unknown = db.query("SELECT * FROM payments WHERE status IN ('PENDING','UNKNOWN') AND simulated=0 ORDER BY id")
     return {"server": "running", "uptime": round(time.time() - STARTED),
             "ocr": {**ocr_engine.status(), "state": STATUS["ocr"], "load_error": STATUS["ocr_error"]},
+            "screen": screen_reader.stats(),
             "adb": STATUS["adb"], "runs": [m.snapshot(r["id"]) for r in active],
             "today": {"real": real_today, "simulated": sim_today}, "unknown_payments": unknown,
             "settings": db.get_settings()}

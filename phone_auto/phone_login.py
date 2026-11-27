@@ -77,10 +77,13 @@ def adb_screencap() -> Image.Image:
 
 
 def get_ui_hierarchy() -> ET.Element:
+    t0 = time.monotonic()
     try:
         return ET.fromstring(adb.dump_xml())
     except adb.AdbError as e:
         raise AdbCallError(str(e)) from None
+    finally:
+        sr.count_dump(time.monotonic() - t0)
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -158,15 +161,18 @@ def _bounds(node: ET.Element) -> tuple[int, int, int, int] | None:
     return tuple(map(int, m.groups())) if m else None
 
 
-def dump_tree(retries: int = 3) -> ET.Element | None:
-    """uiautomator dump — 화면 전환 중엔 'could not get idle state' 로 실패하므로 몇 번 재시도."""
-    for _ in range(retries):
-        try:
-            return fill_empty_webview(get_ui_hierarchy())
-        except (AdbCallError, ET.ParseError) as e:
-            print(f"   [dump] 실패, 재시도: {e}", flush=True)
-            time.sleep(0.7)
-    return None
+def dump_tree(retries: int = 3, fresh: bool = False) -> ET.Element | None:
+    """uiautomator dump — 화면 전환 중엔 'could not get idle state' 로 실패하므로 몇 번 재시도.
+    입력이 없었고 화면이 그대로면 직전 dump 를 재사용한다(screen_reader.cached_dump). fresh=True 면 항상 새로."""
+    def fetch():
+        for _ in range(retries):
+            try:
+                return fill_empty_webview(get_ui_hierarchy())
+            except (AdbCallError, ET.ParseError) as e:
+                print(f"   [dump] 실패, 재시도: {e}", flush=True)
+                time.sleep(0.7)
+        return None
+    return sr.cached_dump(fetch, fresh=fresh, cacheable=lambda t: not _empty_webview(t))
 
 
 def _empty_webview(tree: ET.Element) -> bool:
@@ -225,8 +231,12 @@ def read_screen() -> tuple[Image.Image, ET.Element | None, list[dict]]:
     return img, tree, ocr_texts(img) + dump_texts(tree)
 
 
+LAST_DETECT = {"tree": None}   # detect_screen 이 마지막으로 판정한 dump (같은 화면 오류 문구·확인 버튼 찾기에 재사용)
+
+
 def detect_screen() -> str:
     tree = dump_tree()   # 판정은 dump 로 충분하다 (스크린샷·OCR 생략)
+    LAST_DETECT["tree"] = tree
     t, ids = " ".join(it["text"] for it in dump_texts(tree)), dump_ids(tree)
     for name, pred in SCREEN_MARKERS:
         if pred(t, ids):
@@ -541,7 +551,7 @@ def wait_result(timeout: float = RESULT_TIMEOUT) -> str:
         if s in ("HOME", "CAPTCHA_WRONG", "LOGIN_REJECTED", "ALERT"):
             break
     if s in ("CAPTCHA_WRONG", "LOGIN_REJECTED", "ALERT"):
-        msg = [it["text"] for it in dump_texts(dump_tree()) if len(it["text"]) > 4]
+        msg = [it["text"] for it in dump_texts(LAST_DETECT["tree"]) if len(it["text"]) > 4]   # 방금 판정한 화면(dump 1회 절약)
         print(f"[phone_login] 오류 팝업: {msg[:3]}", flush=True)
     if s == "HOME":   # 폼이 닫혔다 ≠ 로그인 성공 → 마이 탭으로 확인
         close_popups(clean_needed=1)   # 로그인 직후 팝업이 탭을 가린다
@@ -549,9 +559,13 @@ def wait_result(timeout: float = RESULT_TIMEOUT) -> str:
     return s
 
 
-def dismiss_error(layout: dict) -> None:
-    _, tree, texts = read_screen()
-    xy = locate("error_ok", layout, tree, texts)
+def dismiss_error(layout: dict, tree: ET.Element | None = None) -> None:
+    """오류 알림 '확인'. 방금 판정한 dump 에 확인 버튼(button1)이 있으면 그대로 누르고, 없을 때만 화면을 다시 읽는다."""
+    b = find_node_bounds(tree, layout["error_ok"]) if tree is not None else None
+    xy = ((b[0] + b[2]) // 2, (b[1] + b[3]) // 2) if b else None
+    if xy is None:
+        _, tree, texts = read_screen()
+        xy = locate("error_ok", layout, tree, texts)
     if xy:
         tap(xy); time.sleep(0.8)
 
@@ -595,7 +609,7 @@ def attempt(no: str, acct: dict, layout: dict) -> str:
     print(f"[phone_login] 결과 확인 {time.time() - t0:.1f}s", flush=True)
     if result != "LOGGED_IN":
         shot_fail(no, result)
-        dismiss_error(layout)
+        dismiss_error(layout, LAST_DETECT["tree"] if result in ("CAPTCHA_WRONG", "LOGIN_REJECTED", "ALERT") else None)
     return result
 
 
